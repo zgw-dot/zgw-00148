@@ -10,7 +10,8 @@ from db import (
     STATUS_PENDING_ACCOUNTABILITY, STATUS_CLOSED, VALID_TRANSITIONS, IMPORT_TYPES,
     get_discrepancies, get_evidence_for_discrepancy, get_status_log,
     get_stores, get_import_records, transition_status, update_review_note,
-    get_active_rule_version, now_iso,
+    get_active_rule_version, now_iso, get_snapshot_for_discrepancy,
+    get_calc_steps_for_discrepancy,
 )
 from import_service import import_csv
 from engine import run_attribution, CAUSE_LABELS
@@ -255,6 +256,74 @@ with tab3:
                         from_l = STATUS_LABELS.get(log["from_status"], log["from_status"] or "新建")
                         to_l = STATUS_LABELS.get(log["to_status"], log["to_status"])
                         st.markdown(f"- {log['changed_at'][:19]}: {from_l} → {to_l}" + (f" ({log.get('note', '')})" if log.get("note") else ""))
+
+                st.divider()
+                st.markdown("### 🧾 归因快照（可回放解释链路）")
+                with get_conn() as conn:
+                    snap = get_snapshot_for_discrepancy(conn, d["id"])
+                    calc_steps = get_calc_steps_for_discrepancy(conn, d["id"])
+
+                if snap:
+                    snap_col1, snap_col2 = st.columns(2)
+                    with snap_col1:
+                        st.markdown("**规则配置快照（当时生效）**")
+                        cfg = snap.get("rule_config_snapshot", {}) or {}
+                        cfg_display = {
+                            "损耗阈值(%)": cfg.get("loss_threshold_pct", "-"),
+                            "损耗阈值(绝对值)": cfg.get("loss_threshold_abs", "-"),
+                            "调拨延迟窗口(天)": cfg.get("transfer_delay_days", "-"),
+                            "条码别名映射": cfg.get("aliases", {}) if cfg.get("aliases") else "(无)",
+                        }
+                        st.json(cfg_display, expanded=False)
+
+                    with snap_col2:
+                        st.markdown("**别名映射与命中ID**")
+                        if snap.get("alias_before"):
+                            st.markdown(f"- **映射前条码**: `{snap['alias_before']}`")
+                            st.markdown(f"- **映射后规范条码**: `{snap['alias_after']}`")
+                        else:
+                            st.markdown("- 别名映射: 无（直接使用原始条码）")
+                        st.markdown(f"- 命中库存原始ID: `{snap.get('raw_inventory_ids', [])}`")
+                        st.markdown(f"- 命中盘点原始ID: `{snap.get('raw_stocktake_ids', [])}`")
+                        st.markdown(f"- 命中销售原始ID: `{snap.get('raw_sales_ids', [])}`")
+                        st.markdown(f"- 命中调拨原始ID: `{snap.get('raw_transfer_ids', [])}`")
+                        st.markdown(f"- 快照生成时间: `{snap.get('created_at', '')[:19]}`")
+
+                    st.markdown("**📊 计算步骤回放（从初始差异到最终归因）**")
+                    if calc_steps:
+                        for cs in calc_steps:
+                            step_type_label = {
+                                "init": "🔢 初始计算",
+                                "sales": "🛒 销售扣减",
+                                "transfer_out": "📤 调拨出库扣减",
+                                "transfer_in": "📥 调拨入库扣减",
+                                "normal_loss": "⚖️ 正常损耗判定",
+                                "unknown_loss": "❓ 未知缺失",
+                                "unknown_surplus": "📈 盘盈",
+                            }.get(cs["step_type"], cs["step_type"])
+                            with st.container():
+                                sc1, sc2, sc3, sc4 = st.columns([2, 3, 2, 2])
+                                with sc1:
+                                    st.markdown(f"**{step_type_label}**")
+                                with sc2:
+                                    st.markdown(cs["step_description"])
+                                with sc3:
+                                    if cs["step_type"] != "init":
+                                        st.markdown(f"扣减: **{cs['amount_applied']:+.1f}**")
+                                    else:
+                                        st.markdown("—")
+                                with sc4:
+                                    if cs["step_type"] != "init":
+                                        st.markdown(f"剩余: {cs['remaining_before']:.1f} → **{cs['remaining_after']:.1f}**")
+                                    else:
+                                        st.markdown(f"初始: **{cs['remaining_after']:+.1f}**")
+                                if cs.get("raw_data_ids"):
+                                    with st.expander(f"  🔗 关联原始数据ID ({len(cs['raw_data_ids'])}条)", expanded=False):
+                                        st.markdown(f"原始ID列表: `{cs['raw_data_ids']}`")
+                    else:
+                        st.info("该差异暂无计算步骤记录（可能为旧版数据，建议重新归因）")
+                else:
+                    st.info("该差异暂无归因快照（可能为旧版数据，建议重新归因生成）")
     else:
         st.info("暂无差异记录，请先导入数据并运行归因分析")
 
@@ -330,7 +399,7 @@ with tab4:
 # ── Tab 5: 导出 ──
 with tab5:
     st.header("导出数据")
-    st.markdown("导出包含**差异明细、复核备注、来源证据行、状态流转日志**，可独立复盘。")
+    st.markdown("导出包含**差异明细、复核备注、来源证据行、状态流转日志、归因快照（规则+别名+计算步骤）**，可独立复盘。")
 
     with get_conn() as conn:
         stores = get_stores(conn)
@@ -347,6 +416,8 @@ with tab5:
             for d in discs:
                 d["evidence_lines"] = get_evidence_for_discrepancy(conn, d["id"])
                 d["status_logs"] = get_status_log(conn, d["id"])
+                d["snapshot"] = get_snapshot_for_discrepancy(conn, d["id"])
+                d["calc_steps"] = get_calc_steps_for_discrepancy(conn, d["id"])
 
         for d in discs:
             d["status_label"] = STATUS_LABELS.get(d["status"], d["status"])
@@ -366,12 +437,76 @@ with tab5:
                 log_parts.append(f"{lg['changed_at'][:19]}: {from_l} → {to_l}{note}")
             d["status_log_summary"] = " | ".join(log_parts) if log_parts else ""
 
+            snap = d.get("snapshot")
+            if snap:
+                cfg = snap.get("rule_config_snapshot", {}) or {}
+                alias_info = ""
+                if snap.get("alias_before"):
+                    alias_info = f"{snap['alias_before']} → {snap['alias_after']}"
+                d["snapshot_alias"] = alias_info or "(无别名映射)"
+                d["snapshot_rule_config"] = json.dumps(cfg, ensure_ascii=False)
+                d["snapshot_created_at"] = snap.get("created_at", "")[:19] if snap.get("created_at") else ""
+                d["snapshot_inv_ids"] = json.dumps(snap.get("raw_inventory_ids", []), ensure_ascii=False)
+                d["snapshot_stk_ids"] = json.dumps(snap.get("raw_stocktake_ids", []), ensure_ascii=False)
+                d["snapshot_sal_ids"] = json.dumps(snap.get("raw_sales_ids", []), ensure_ascii=False)
+                d["snapshot_tra_ids"] = json.dumps(snap.get("raw_transfer_ids", []), ensure_ascii=False)
+            else:
+                d["snapshot_alias"] = "(无快照，建议重新归因)"
+                d["snapshot_rule_config"] = ""
+                d["snapshot_created_at"] = ""
+                d["snapshot_inv_ids"] = "[]"
+                d["snapshot_stk_ids"] = "[]"
+                d["snapshot_sal_ids"] = "[]"
+                d["snapshot_tra_ids"] = "[]"
+
+            calc_steps = d.get("calc_steps", [])
+            if calc_steps:
+                step_labels_map = {
+                    "init": "初始计算", "sales": "销售扣减", "transfer_out": "调拨出库扣减",
+                    "transfer_in": "调拨入库扣减", "normal_loss": "正常损耗判定",
+                    "unknown_loss": "未知缺失", "unknown_surplus": "盘盈",
+                }
+                calc_summary_parts = []
+                for idx, cs in enumerate(calc_steps):
+                    st_label = step_labels_map.get(cs["step_type"], cs["step_type"])
+                    if cs["step_type"] == "init":
+                        calc_summary_parts.append(
+                            f"[{idx+1}]{st_label}: {cs['step_description']}"
+                        )
+                    else:
+                        calc_summary_parts.append(
+                            f"[{idx+1}]{st_label}: {cs['step_description']} "
+                            f"(扣减{cs['amount_applied']:+.1f}, 剩{cs['remaining_before']:.1f}→{cs['remaining_after']:.1f})"
+                        )
+                d["calc_steps_summary"] = " || ".join(calc_summary_parts)
+                d["calc_steps_json"] = json.dumps(
+                    [
+                        {
+                            "step_index": cs["step_index"],
+                            "step_type": cs["step_type"],
+                            "step_description": cs["step_description"],
+                            "amount_applied": cs["amount_applied"],
+                            "remaining_before": cs["remaining_before"],
+                            "remaining_after": cs["remaining_after"],
+                            "raw_data_ids": cs.get("raw_data_ids", []),
+                        }
+                        for cs in calc_steps
+                    ],
+                    ensure_ascii=False,
+                )
+            else:
+                d["calc_steps_summary"] = "(无计算步骤，建议重新归因)"
+                d["calc_steps_json"] = "[]"
+
         export_cols = [
             "id", "store_id", "barcode", "sku_name", "system_qty", "actual_qty",
             "diff_qty", "attributed_cause", "cause_label", "cause_detail",
             "rule_ver", "status", "status_label",
             "review_note", "reviewed_at", "created_at", "updated_at",
             "evidence_summary", "status_log_summary",
+            "snapshot_alias", "snapshot_rule_config", "snapshot_created_at",
+            "snapshot_inv_ids", "snapshot_stk_ids", "snapshot_sal_ids", "snapshot_tra_ids",
+            "calc_steps_summary", "calc_steps_json",
         ]
 
         df_export = pd.DataFrame(discs)
@@ -383,6 +518,9 @@ with tab5:
             "规则版本", "状态编码", "状态",
             "复核备注", "复核时间", "创建时间", "更新时间",
             "来源证据", "状态流转",
+            "快照-别名映射", "快照-当时规则配置(JSON)", "快照-生成时间",
+            "快照-库存原始ID", "快照-盘点原始ID", "快照-销售原始ID", "快照-调拨原始ID",
+            "计算步骤(文本)", "计算步骤(JSON)",
         ]
 
         st.dataframe(df_display, use_container_width=True, hide_index=True)
@@ -391,7 +529,7 @@ with tab5:
             csv_buf = io.StringIO()
             df_display.to_csv(csv_buf, index=False, encoding="utf-8-sig")
             st.download_button(
-                "⬇️ 下载 CSV（含证据+流转+备注）",
+                "⬇️ 下载 CSV（含完整证据+流转+快照+计算步骤）",
                 data=csv_buf.getvalue().encode("utf-8-sig"),
                 file_name=f"discrepancies_full_{now_iso()[:10]}.csv",
                 mime="text/csv",
@@ -399,6 +537,23 @@ with tab5:
         else:
             json_obj = []
             for d in discs:
+                snap = d.get("snapshot")
+                snap_obj = None
+                if snap:
+                    snap_obj = {
+                        "alias_before": snap.get("alias_before"),
+                        "alias_after": snap.get("alias_after"),
+                        "rule_config_snapshot": snap.get("rule_config_snapshot", {}),
+                        "system_qty_snapshot": snap.get("system_qty_snapshot"),
+                        "actual_qty_snapshot": snap.get("actual_qty_snapshot"),
+                        "diff_qty_snapshot": snap.get("diff_qty_snapshot"),
+                        "raw_inventory_ids": snap.get("raw_inventory_ids", []),
+                        "raw_stocktake_ids": snap.get("raw_stocktake_ids", []),
+                        "raw_sales_ids": snap.get("raw_sales_ids", []),
+                        "raw_transfer_ids": snap.get("raw_transfer_ids", []),
+                        "created_at": snap.get("created_at"),
+                    }
+                calc_steps = d.get("calc_steps", [])
                 json_obj.append({
                     "id": d["id"],
                     "store_id": d["store_id"],
@@ -439,10 +594,29 @@ with tab5:
                         }
                         for lg in d["status_logs"]
                     ],
+                    "attribution_snapshot": snap_obj,
+                    "calculation_steps": [
+                        {
+                            "step_index": cs["step_index"],
+                            "step_type": cs["step_type"],
+                            "step_type_label": {
+                                "init": "初始计算", "sales": "销售扣减",
+                                "transfer_out": "调拨出库扣减", "transfer_in": "调拨入库扣减",
+                                "normal_loss": "正常损耗判定", "unknown_loss": "未知缺失",
+                                "unknown_surplus": "盘盈",
+                            }.get(cs["step_type"], cs["step_type"]),
+                            "step_description": cs["step_description"],
+                            "amount_applied": cs["amount_applied"],
+                            "remaining_before": cs["remaining_before"],
+                            "remaining_after": cs["remaining_after"],
+                            "raw_data_ids": cs.get("raw_data_ids", []),
+                        }
+                        for cs in calc_steps
+                    ],
                 })
             json_str = json.dumps(json_obj, ensure_ascii=False, indent=2, default=str)
             st.download_button(
-                "⬇️ 下载 JSON（嵌套证据+流转+备注）",
+                "⬇️ 下载 JSON（嵌套证据+流转+快照+计算步骤，可独立复盘）",
                 data=json_str.encode("utf-8"),
                 file_name=f"discrepancies_full_{now_iso()[:10]}.json",
                 mime="application/json",

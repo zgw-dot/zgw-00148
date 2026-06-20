@@ -94,6 +94,38 @@ CREATE TABLE IF NOT EXISTS barcode_aliases (
     canonical_barcode TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS attribution_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    discrepancy_id INTEGER NOT NULL,
+    rule_version_id INTEGER NOT NULL,
+    rule_config_snapshot TEXT NOT NULL,
+    alias_before TEXT,
+    alias_after TEXT,
+    system_qty_snapshot REAL NOT NULL,
+    actual_qty_snapshot REAL NOT NULL,
+    diff_qty_snapshot REAL NOT NULL,
+    raw_inventory_ids TEXT,
+    raw_stocktake_ids TEXT,
+    raw_sales_ids TEXT,
+    raw_transfer_ids TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (discrepancy_id) REFERENCES discrepancies(id),
+    FOREIGN KEY (rule_version_id) REFERENCES rule_versions(id)
+);
+
+CREATE TABLE IF NOT EXISTS discrepancy_calc_steps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    discrepancy_id INTEGER NOT NULL,
+    step_index INTEGER NOT NULL,
+    step_type TEXT NOT NULL,
+    step_description TEXT NOT NULL,
+    amount_applied REAL NOT NULL,
+    remaining_before REAL NOT NULL,
+    remaining_after REAL NOT NULL,
+    raw_data_ids TEXT,
+    FOREIGN KEY (discrepancy_id) REFERENCES discrepancies(id)
+);
 """
 
 STATUS_PENDING_REVIEW = "pending_review"
@@ -279,4 +311,96 @@ def get_import_records(conn):
 def clear_all_discrepancies(conn):
     conn.execute("DELETE FROM status_log")
     conn.execute("DELETE FROM evidence_lines")
+    conn.execute("DELETE FROM discrepancy_calc_steps")
+    conn.execute("DELETE FROM attribution_snapshots")
     conn.execute("DELETE FROM discrepancies")
+
+
+def get_discrepancy_by_business_key(conn, store_id, barcode):
+    row = conn.execute(
+        "SELECT * FROM discrepancies WHERE store_id = ? AND barcode = ? LIMIT 1",
+        (store_id, barcode),
+    ).fetchone()
+    if row:
+        return dict(row)
+    return None
+
+
+def delete_evidence_for_discrepancy(conn, discrepancy_id):
+    conn.execute("DELETE FROM evidence_lines WHERE discrepancy_id = ?", (discrepancy_id,))
+
+
+def delete_snapshots_for_discrepancy(conn, discrepancy_id):
+    conn.execute("DELETE FROM discrepancy_calc_steps WHERE discrepancy_id = ?", (discrepancy_id,))
+    conn.execute("DELETE FROM attribution_snapshots WHERE discrepancy_id = ?", (discrepancy_id,))
+
+
+def insert_attribution_snapshot(conn, discrepancy_id, rule_version_id, rule_config_snapshot,
+                                alias_before, alias_after, system_qty_snapshot, actual_qty_snapshot,
+                                diff_qty_snapshot, raw_inventory_ids, raw_stocktake_ids,
+                                raw_sales_ids, raw_transfer_ids):
+    now = now_iso()
+    conn.execute(
+        """INSERT INTO attribution_snapshots
+           (discrepancy_id, rule_version_id, rule_config_snapshot, alias_before, alias_after,
+            system_qty_snapshot, actual_qty_snapshot, diff_qty_snapshot,
+            raw_inventory_ids, raw_stocktake_ids, raw_sales_ids, raw_transfer_ids, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            discrepancy_id, rule_version_id,
+            json.dumps(rule_config_snapshot, ensure_ascii=False),
+            alias_before, alias_after,
+            system_qty_snapshot, actual_qty_snapshot, diff_qty_snapshot,
+            json.dumps(raw_inventory_ids or []) if raw_inventory_ids else "[]",
+            json.dumps(raw_stocktake_ids or []) if raw_stocktake_ids else "[]",
+            json.dumps(raw_sales_ids or []) if raw_sales_ids else "[]",
+            json.dumps(raw_transfer_ids or []) if raw_transfer_ids else "[]",
+            now,
+        ),
+    )
+
+
+def insert_calc_step(conn, discrepancy_id, step_index, step_type, step_description,
+                     amount_applied, remaining_before, remaining_after, raw_data_ids):
+    conn.execute(
+        """INSERT INTO discrepancy_calc_steps
+           (discrepancy_id, step_index, step_type, step_description,
+            amount_applied, remaining_before, remaining_after, raw_data_ids)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            discrepancy_id, step_index, step_type, step_description,
+            amount_applied, remaining_before, remaining_after,
+            json.dumps(raw_data_ids or [], ensure_ascii=False) if raw_data_ids else "[]",
+        ),
+    )
+
+
+def get_snapshot_for_discrepancy(conn, discrepancy_id):
+    row = conn.execute(
+        "SELECT * FROM attribution_snapshots WHERE discrepancy_id = ? ORDER BY id DESC LIMIT 1",
+        (discrepancy_id,),
+    ).fetchone()
+    if not row:
+        return None
+    snap = dict(row)
+    for k in ["rule_config_snapshot", "raw_inventory_ids", "raw_stocktake_ids",
+            "raw_sales_ids", "raw_transfer_ids"]:
+        try:
+            snap[k] = json.loads(snap[k]) if snap.get(k) else None
+        except (TypeError, json.JSONDecodeError):
+            snap[k] = None
+    return snap
+
+
+def get_calc_steps_for_discrepancy(conn, discrepancy_id):
+    rows = conn.execute(
+        "SELECT * FROM discrepancy_calc_steps WHERE discrepancy_id = ? ORDER BY step_index",
+        (discrepancy_id,),
+    ).fetchall()
+    steps = [dict(r) for r in rows]
+    for s in steps:
+        try:
+            s["raw_data_ids"] = json.loads(s["raw_data_ids"]) if s.get("raw_data_ids") else []
+        except (TypeError, json.JSONDecodeError):
+            s["raw_data_ids"] = []
+    return steps

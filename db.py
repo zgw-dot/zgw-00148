@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS raw_data (
     source_line INTEGER NOT NULL,
     store_id TEXT,
     barcode TEXT NOT NULL,
+    canonical_barcode TEXT NOT NULL,
     sku_name TEXT,
     system_qty REAL,
     actual_qty REAL,
@@ -404,3 +405,15 @@ def get_calc_steps_for_discrepancy(conn, discrepancy_id):
         except (TypeError, json.JSONDecodeError):
             s["raw_data_ids"] = []
     return steps
+
+
+DEFAULT_RULES = {
+    "loss_threshold_pct": 2.0,
+    "loss_threshold_abs": 3.0,
+    "transfer_delay_days": 3,
+    "aliases": {},
+}
+
+
+def resolve_barcode(barcode, aliases):
+    return aliases.get(barcode, barcode)

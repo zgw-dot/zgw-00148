@@ -2,7 +2,7 @@ import csv
 import hashlib
 import io
 import json
-from db import get_conn, now_iso
+from db import get_conn, now_iso, get_active_rule_version, resolve_barcode, DEFAULT_RULES
 
 REQUIRED_FIELDS = {
     "inventory": ["store_id", "barcode", "sku_name", "system_qty"],
@@ -135,6 +135,14 @@ def import_csv(import_type, file_name, content_bytes):
         )
         import_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
+        rule_rec = get_active_rule_version(conn)
+        if rule_rec:
+            import json as _json
+            rule_cfg = _json.loads(rule_rec["config_json"])
+        else:
+            rule_cfg = DEFAULT_RULES.copy()
+        aliases = rule_cfg.get("aliases", {})
+
         insert_count = 0
         for line_num, row in valid_rows:
             defensive_err = _defensive_check(import_type, line_num, row)
@@ -148,18 +156,22 @@ def import_csv(import_type, file_name, content_bytes):
             sale_qty = _safe_float(row.get("sale_qty"))
             transfer_qty = _safe_float(row.get("transfer_qty"))
 
+            raw_barcode = row.get("barcode", "")
+            canonical_barcode = resolve_barcode(raw_barcode, aliases)
+
             conn.execute(
                 """INSERT INTO raw_data
-                   (import_id, source_type, source_line, store_id, barcode, sku_name,
+                   (import_id, source_type, source_line, store_id, barcode, canonical_barcode, sku_name,
                     system_qty, actual_qty, sale_qty, sale_date,
                     transfer_qty, transfer_date, store_id_from, store_id_to, raw_row)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     import_id,
                     import_type,
                     line_num,
                     row.get("store_id", ""),
-                    row.get("barcode", ""),
+                    raw_barcode,
+                    canonical_barcode,
                     row.get("sku_name", ""),
                     system_qty,
                     actual_qty,

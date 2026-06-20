@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 from db import (
     get_conn, now_iso, get_active_rule_version, clear_all_discrepancies,
     get_discrepancy_by_business_key, insert_attribution_snapshot, insert_calc_step,
+    resolve_barcode, DEFAULT_RULES,
 )
 from import_service import get_inventory_data, get_stocktake_data, get_sales_data, get_transfer_data
 
@@ -22,17 +23,6 @@ CAUSE_LABELS = {
     CAUSE_TRANSFER_IN_PENDING: "调拨入库在途",
 }
 
-DEFAULT_RULES = {
-    "loss_threshold_pct": 2.0,
-    "loss_threshold_abs": 3.0,
-    "transfer_delay_days": 3,
-    "aliases": {},
-}
-
-
-def resolve_barcode(barcode, aliases):
-    return aliases.get(barcode, barcode)
-
 
 def run_attribution():
     with get_conn() as conn:
@@ -44,11 +34,9 @@ def run_attribution():
         else:
             cfg = json.loads(rule_rec["config_json"])
 
-        aliases = cfg.get("aliases", {})
         loss_pct = cfg.get("loss_threshold_pct", 2.0)
         loss_abs = cfg.get("loss_threshold_abs", 3.0)
         delay_days = cfg.get("transfer_delay_days", 3)
-
         inv_data = get_inventory_data(conn)
         stk_data = get_stocktake_data(conn)
         sal_data = get_sales_data(conn)
@@ -61,7 +49,7 @@ def run_attribution():
         inv_raw_barcodes = {}
         for r in inv_data:
             raw_bc = r["barcode"]
-            cb = resolve_barcode(raw_bc, aliases)
+            cb = r["canonical_barcode"]
             key = (r["store_id"], cb)
             if key not in inv_map:
                 inv_map[key] = {"system_qty": 0, "sku_name": r["sku_name"] or "", "raw_ids": []}
@@ -75,7 +63,7 @@ def run_attribution():
         stk_raw_barcodes = {}
         for r in stk_data:
             raw_bc = r["barcode"]
-            cb = resolve_barcode(raw_bc, aliases)
+            cb = r["canonical_barcode"]
             key = (r["store_id"], cb)
             if key not in stk_map:
                 stk_map[key] = {"actual_qty": 0, "sku_name": r["sku_name"] or "", "raw_ids": []}
@@ -88,7 +76,7 @@ def run_attribution():
         sales_by_key = {}
         for r in sal_data:
             raw_bc = r["barcode"]
-            cb = resolve_barcode(raw_bc, aliases)
+            cb = r["canonical_barcode"]
             key = (r["store_id"], cb)
             if key not in sales_by_key:
                 sales_by_key[key] = {"total_sale": 0, "raw_ids": []}
@@ -100,7 +88,7 @@ def run_attribution():
         cutoff = now - timedelta(days=delay_days)
         for r in tra_data:
             raw_bc = r["barcode"]
-            cb = resolve_barcode(raw_bc, aliases)
+            cb = r["canonical_barcode"]
             try:
                 tdate = datetime.fromisoformat(r["transfer_date"])
                 within_window = tdate >= cutoff
@@ -152,7 +140,6 @@ def run_attribution():
                 sales_by_key.get(key), transfers_by_key.get(key),
                 inv_map.get(key, {}).get("raw_ids", []),
                 stk_map.get(key, {}).get("raw_ids", []),
-                aliases,
             )
 
             conn.execute(
@@ -208,7 +195,7 @@ def run_attribution():
 
 
 def _attribute(key, diff, sys_qty, act_qty, loss_pct, loss_abs, sales_info, transfer_info,
-               inv_raw_ids, stk_raw_ids, aliases):
+               inv_raw_ids, stk_raw_ids):
     evidence = []
     calc_steps = []
     store_id, barcode = key

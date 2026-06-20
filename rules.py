@@ -1,9 +1,9 @@
 import json
 from db import (
     get_conn, get_active_rule_version, get_all_rule_versions,
-    insert_rule_version, validate_rule_config, now_iso,
+    insert_rule_version, validate_rule_config, now_iso, DEFAULT_RULES,
 )
-from engine import DEFAULT_RULES, run_attribution
+from engine import run_attribution
 
 
 def save_rule_config(new_config):

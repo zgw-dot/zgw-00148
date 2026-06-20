@@ -22,7 +22,7 @@ DB_PATH = os.path.join(BASE_DIR, "inventory_diff.db")
 
 if os.path.exists(DB_PATH):
     os.remove(DB_PATH)
-    print("🧹 已清空旧数据库")
+    print("[清理] 已清空旧数据库")
 
 from db import (
     init_db, get_conn, get_discrepancies, get_evidence_for_discrepancy,
@@ -46,9 +46,9 @@ errors_total = []
 
 def check(name, cond, detail=""):
     if cond:
-        print(f"  ✅ {name}")
+        print(f"  [OK] {name}")
     else:
-        print(f"  ❌ {name}  {detail}")
+        print(f"  [FAIL] {name}  {detail}")
         errors_total.append((name, detail))
 
 
@@ -56,6 +56,57 @@ def read_sample(fname):
     with open(os.path.join(SAMPLE_DIR, fname), "rb") as f:
         return f.read()
 
+
+# =============================================================
+print("\n" + "=" * 70)
+print("测试 0: GBK 终端输出兼容性（默认 Windows PowerShell 环境）")
+print("=" * 70)
+import io as _io
+
+GBK_SAMPLE_STRINGS = [
+    "[清理] 已清空旧数据库",
+    "  [OK] 测试通过样例",
+    "  [FAIL] 测试失败样例",
+    "测试 X: 标题样例 — 中文说明",
+    "第 3 行: 缺少必填字段 'sku_name'",
+    "第 5 行: 字段 'sale_qty' 的值 'abc' 不是有效数值",
+    "S003 无差异（坏行未入库，无法归因）",
+    "复核备注 + 状态流转 + 流转日志（正常流程）",
+    "坏行不进入 CSV/JSON 导出",
+    "门店筛选 — S001/S002/S003 严格隔离",
+    "库存导入成功: valid=10",
+    "销售导入成功: valid=3",
+    "差异总数>0",
+    "[FAIL] 共 3 项失败:",
+    "[全部通过] 全部销售导入链路收紧回归测试通过!",
+    "store_id, barcode, sku_name, sale_qty, sale_date",
+    "正常商品C, 空数量商品, 全空格数量, 正常商品D",
+]
+_gbk_ok = True
+_gbk_errors = []
+for _i, _s in enumerate(GBK_SAMPLE_STRINGS):
+    try:
+        _s.encode("gbk")
+    except UnicodeEncodeError as _e:
+        _gbk_ok = False
+        _gbk_errors.append(f"字符串#{_i}: {_e}")
+check("所有输出字符串都能用 GBK 编码（默认 Windows 终端兼容）", _gbk_ok,
+      "; ".join(_gbk_errors) if _gbk_errors else "")
+
+_gbk_buf = _io.BytesIO()
+_gbk_out = _io.TextIOWrapper(_gbk_buf, encoding="gbk", errors="strict")
+try:
+    for _s in GBK_SAMPLE_STRINGS:
+        _gbk_out.write(_s + "\n")
+    _gbk_out.flush()
+    _gbk_write_ok = True
+    _gbk_write_err = ""
+except UnicodeEncodeError as _e:
+    _gbk_write_ok = False
+    _gbk_write_err = str(_e)
+check("模拟 GBK 终端流式写入不触发 UnicodeEncodeError", _gbk_write_ok, _gbk_write_err)
+
+del _gbk_buf, _gbk_out, _io
 
 # =============================================================
 print("\n" + "=" * 70)
@@ -306,9 +357,9 @@ check("S001+S002 = 总数", len(d1_sel) + len(d2_sel) == len(all_discs))
 # =============================================================
 print("\n" + "=" * 70)
 if errors_total:
-    print(f"❌ 共 {len(errors_total)} 项失败:")
+    print(f"[FAIL] 共 {len(errors_total)} 项失败:")
     for n, d in errors_total:
         print(f"   - {n}: {d}")
     sys.exit(1)
 else:
-    print("🎉 全部销售导入链路收紧回归测试通过!")
+    print("[全部通过] 全部销售导入链路收紧回归测试通过!")

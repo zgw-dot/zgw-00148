@@ -25,7 +25,7 @@ DB_PATH = os.path.join(BASE_DIR, "inventory_diff.db")
 
 if os.path.exists(DB_PATH):
     os.remove(DB_PATH)
-    print("🧹 已清空旧数据库")
+    print("[清理] 已清空旧数据库")
 
 from db import (
     init_db, get_conn, get_discrepancies, get_evidence_for_discrepancy,
@@ -52,9 +52,9 @@ errors_total = []
 
 def check(name, cond, detail=""):
     if cond:
-        print(f"  ✅ {name}")
+        print(f"  [OK] {name}")
     else:
-        print(f"  ❌ {name}  {detail}")
+        print(f"  [FAIL] {name}  {detail}")
         errors_total.append((name, detail))
 
 
@@ -335,9 +335,9 @@ if noted:
 
 print("\n" + "=" * 70)
 if errors_total:
-    print(f"❌ 共 {len(errors_total)} 项失败:")
+    print(f"[FAIL] 共 {len(errors_total)} 项失败:")
     for n, d in errors_total:
         print(f"   - {n}: {d}")
     sys.exit(1)
 else:
-    print("🎉 全部回归测试通过!")
+    print("[全部通过] 全部回归测试通过!")

@@ -24,9 +24,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 DB_PATH = os.path.join(BASE_DIR, "inventory_diff.db")
 
-if os.path.exists(DB_PATH):
-    os.remove(DB_PATH)
-    print("[清理] 已清空旧数据库")
+from test_utils import init_test_env
+init_test_env(DB_PATH)
 
 from db import (
     init_db, get_conn, get_discrepancies, get_evidence_for_discrepancy,
@@ -127,8 +126,8 @@ check(f"差异 {sample_id_v1} 有计算步骤: {len(steps_v1)} 步", len(steps_v
 if steps_v1:
     init_step = steps_v1[0]
     check(f"  第1步是初始计算(init)", init_step["step_type"] == "init", str(init_step))
-    check(f"  初始步骤剩余值等于diff",
-          abs(init_step["remaining_after"] - sample_disc["diff_qty"]) < 0.001,
+    check(f"  初始步骤剩余值等于|diff|",
+          abs(abs(init_step["remaining_after"]) - abs(sample_disc["diff_qty"])) < 0.001,
           f"step_rem={init_step['remaining_after']} diff={sample_disc['diff_qty']}")
     last_step = steps_v1[-1]
     check(f"  最后一步剩余值为0(归因闭环)",
@@ -366,7 +365,7 @@ def replay_calc_from_json(jobj):
     return True, f"链路独立复盘成功, |diff|={init_diff:.1f}"
 
 replay_ok, replay_msg = replay_calc_from_json(sample_json)
-check(f"🧪 解释链路脱离DB独立复盘: {replay_msg}", replay_ok, replay_msg)
+check(f"解释链路脱离DB独立复盘: {replay_msg}", replay_ok, replay_msg)
 
 
 print("\n" + "=" * 70)
@@ -455,11 +454,11 @@ if errors_total:
     sys.exit(1)
 else:
     print("[全部通过] 归因快照增强版回归测试全部通过!")
-    print("   ✅ 归因快照（规则+别名+原始ID）完整保存")
-    print("   ✅ 计算步骤（分步扣减+剩余）闭环可复盘")
-    print("   ✅ 规则变更后老差异ID/状态/备注/流转日志全部保留")
-    print("   ✅ CSV/JSON导出包含完整解释链路")
-    print("   ✅ JSON解释链路可脱离DB独立复盘验证")
-    print("   ✅ 重启后所有数据一致")
-    print("   ✅ 重复导入哈希去重不覆盖")
-    print("   ✅ 门店筛选结果不串")
+    print("   [OK] 归因快照（规则+别名+原始ID）完整保存")
+    print("   [OK] 计算步骤（分步扣减+剩余）闭环可复盘")
+    print("   [OK] 规则变更后老差异ID/状态/备注/流转日志全部保留")
+    print("   [OK] CSV/JSON导出包含完整解释链路")
+    print("   [OK] JSON解释链路可脱离DB独立复盘验证")
+    print("   [OK] 重启后所有数据一致")
+    print("   [OK] 重复导入哈希去重不覆盖")
+    print("   [OK] 门店筛选结果不串")

@@ -14,8 +14,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 DB_PATH = os.path.join(BASE_DIR, "inventory_diff.db")
 
-if os.path.exists(DB_PATH):
-    os.remove(DB_PATH)
+from test_utils import init_test_env
+init_test_env(DB_PATH)
 
 from db import (
     init_db, get_conn, get_discrepancies, get_evidence_for_discrepancy,
@@ -289,9 +289,9 @@ if errors_total:
     sys.exit(1)
 else:
     print("[全部通过] 别名映射不可变回归测试全部通过!")
-    print("   ✅ 导入时canonical_barcode永久固化")
-    print("   ✅ 别名变更后旧数据不重生新差异")
-    print("   ✅ 旧差异快照/证据/状态/备注/流转日志不变")
-    print("   ✅ 新导入数据按新别名解析")
-    print("   ✅ CSV/JSON导出不串口径")
-    print("   ✅ 重启后一致性保持")
+    print("   [OK] 导入时canonical_barcode永久固化")
+    print("   [OK] 别名变更后旧数据不重生新差异")
+    print("   [OK] 旧差异快照/证据/状态/备注/流转日志不变")
+    print("   [OK] 新导入数据按新别名解析")
+    print("   [OK] CSV/JSON导出不串口径")
+    print("   [OK] 重启后一致性保持")

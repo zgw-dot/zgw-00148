@@ -14,8 +14,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 DB_PATH = os.path.join(BASE_DIR, "inventory_diff.db")
 
-if os.path.exists(DB_PATH):
-    os.remove(DB_PATH)
+from test_utils import init_test_env
+init_test_env(DB_PATH)
 
 from db import (
     init_db, get_conn, get_discrepancies, get_evidence_for_discrepancy,
@@ -289,7 +289,7 @@ if errors_total:
     sys.exit(1)
 else:
     print("[全部通过] 归因快照不可变回归测试全部通过!")
-    print("   ✅ 规则变更后旧差异快照/阈值/规则版本/归因结果不变")
-    print("   ✅ 旧差异计算步骤/证据/状态/备注/流转日志不变")
-    print("   ✅ CSV/JSON导出中旧差异解释链路不被新规则污染")
-    print("   ✅ 重启后一致性保持")
+    print("   [OK] 规则变更后旧差异快照/阈值/规则版本/归因结果不变")
+    print("   [OK] 旧差异计算步骤/证据/状态/备注/流转日志不变")
+    print("   [OK] CSV/JSON导出中旧差异解释链路不被新规则污染")
+    print("   [OK] 重启后一致性保持")

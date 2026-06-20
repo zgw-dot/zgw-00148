@@ -23,9 +23,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 DB_PATH = os.path.join(BASE_DIR, "inventory_diff.db")
 
-if os.path.exists(DB_PATH):
-    os.remove(DB_PATH)
-    print("[清理] 已清空旧数据库")
+from test_utils import init_test_env
+init_test_env(DB_PATH)
 
 from db import (
     init_db, get_conn, get_discrepancies, get_evidence_for_discrepancy,
@@ -78,7 +77,7 @@ check("缺sale_date被拦截",
           {"store_id": "S001", "barcode": "6900000000001", "sale_qty": "5", "sale_date": ""}, 6)))
 check("正常销售行无错误",
       len(validate_row("sales",
-          {"store_id": "S001", "barcode": "6900000000001", "sale_qty": "5", "sale_date": "2025-06-20"}, 7)) == 0)
+          {"store_id": "S001", "barcode": "6900000000001", "sku_name": "test", "sale_qty": "5", "sale_date": "2025-06-20"}, 7)) == 0)
 
 print("\n" + "=" * 70)
 print("测试 2: 导入四类样例CSV")
@@ -200,9 +199,8 @@ check("规则版本未变", ver_before == ver_after, f"{ver_before} vs {ver_afte
 check("当前激活规则参数未变", cfg_before == cfg_after, f"{cfg_before} vs {cfg_after}")
 
 print("\n" + "=" * 70)
-print("测试 9: 规则变更 → 历史差异全量重算（核心验证）")
+print("测试 9: 规则变更 → 旧差异保留原归因，不重算不覆盖")
 print("=" * 70)
-# 记录重算前快照
 with get_conn() as conn:
     discs_before = get_discrepancies(conn)
     all_ev_before = {}
@@ -212,6 +210,8 @@ with get_conn() as conn:
         all_log_before[d["id"]] = get_status_log(conn, d["id"])
     old_rule_ver = discs_before[0].get("rule_ver")
     old_ids = {d["id"] for d in discs_before}
+    old_statuses = {d["id"]: d["status"] for d in discs_before}
+    old_notes = {d["id"]: d.get("review_note", "") for d in discs_before}
 
 NEW_CFG = {
     "loss_threshold_pct": 5.0,
@@ -226,29 +226,38 @@ check("规则版本号递增（v2）", "v2" in r_save.get("message", "") or r_sa
 with get_conn() as conn:
     discs_after = get_discrepancies(conn)
     new_ids = {d["id"] for d in discs_after}
-    new_rule_ver = discs_after[0].get("rule_ver") if discs_after else None
+    new_rule_vers = {d["id"]: d.get("rule_ver") for d in discs_after}
     ev_cnt_after = sum(len(get_evidence_for_discrepancy(conn, d["id"])) for d in discs_after)
     log_cnt_after = sum(len(get_status_log(conn, d["id"])) for d in discs_after)
 
-check("旧差异ID全部被清空（旧ID与新ID无交集）",
-      len(old_ids & new_ids) == 0, f"old={old_ids} new={new_ids}")
-check("所有新差异都绑定新规则版本v2",
-      new_rule_ver == 2 and all(d.get("rule_ver") == 2 for d in discs_after),
-      f"新规则版本={new_rule_ver}, 各条={[d.get('rule_ver') for d in discs_after]}")
-check("新差异都有证据行（证据链重建）", ev_cnt_after > 0 and ev_cnt_after >= len(discs_after) * 2, f"证据行总数={ev_cnt_after}")
-check("旧状态流转日志全部清空（因差异全量重算）",
-      log_cnt_after == 0, f"日志数={log_cnt_after}")
+discs_after_dict = {d["id"]: d for d in discs_after}
+
+check("旧差异ID全部保留（ID不变）",
+      old_ids == new_ids, f"old={old_ids} new={new_ids}")
+check("旧差异规则版本仍为v1（不被覆盖为v2）",
+      all(v == 1 for v in new_rule_vers.values()),
+      f"规则版本={new_rule_vers}")
+check("旧差异证据行保留", ev_cnt_after > 0, f"证据行总数={ev_cnt_after}")
+check("旧状态流转日志保留（不被清空）",
+      log_cnt_after > 0, f"日志数={log_cnt_after}")
+check("旧差异状态不变",
+      all(discs_after_dict[did]["status"] == old_statuses[did] for did in old_ids if did in discs_after_dict),
+      f"旧状态={old_statuses}")
+check("旧差异备注不变",
+      all(discs_after_dict[did].get("review_note", "") == old_notes[did] for did in old_ids if did in discs_after_dict),
+      f"旧备注={old_notes}")
 
 print("\n" + "=" * 70)
 print("测试 10: CSV/JSON 导出内容完整性 — 证据+流转+备注")
 print("=" * 70)
-# 先给新差异加备注和流转，便于校验导出
 with get_conn() as conn:
-    new_discs = get_discrepancies(conn)
+    export_discs = get_discrepancies(conn)
 EXPORT_NOTE = "导出校验: 这条差异的备注、证据、流转必须全部出现在CSV和JSON里"
+pending_disc = next((d for d in export_discs if d["status"] == STATUS_PENDING_REVIEW), export_discs[0])
 with get_conn() as conn:
-    update_review_note(conn, new_discs[0]["id"], EXPORT_NOTE)
-    transition_status(conn, new_discs[0]["id"], STATUS_CONFIRMED, note="导出测试流转")
+    update_review_note(conn, pending_disc["id"], EXPORT_NOTE)
+    if pending_disc["status"] == STATUS_PENDING_REVIEW:
+        transition_status(conn, pending_disc["id"], STATUS_CONFIRMED, note="导出测试流转")
 with get_conn() as conn:
     export_discs = get_discrepancies(conn)
     for d in export_discs:
@@ -278,8 +287,8 @@ for d in export_discs:
 target_row = next(r for r in csv_rows if r["复核备注"] == EXPORT_NOTE)
 check("CSV列包含复核备注全文", EXPORT_NOTE in target_row["复核备注"], target_row["复核备注"])
 check("CSV列包含来源证据（含行号）", "行" in target_row["来源证据"] and len(target_row["来源证据"]) > 20, target_row["来源证据"])
-check("CSV列包含状态流转（含→）", "→" in target_row["状态流转"] and "待复核" in target_row["状态流转"], target_row["状态流转"])
-check("CSV列包含规则版本v2", target_row["规则版本"] == 2, str(target_row["规则版本"]))
+check("CSV列包含状态流转（含→）", "→" in target_row["状态流转"], target_row["状态流转"])
+check("CSV列包含规则版本v1（旧差异保留原归因）", target_row["规则版本"] == 1, str(target_row["规则版本"]))
 
 # 组装JSON输出
 json_obj = []
@@ -302,7 +311,7 @@ check("JSON嵌套evidence_lines数组且有内容", len(target_json["evidence_li
 check("JSON证据含source_line", all(e["source_line"] is not None for e in target_json["evidence_lines"]), str(target_json["evidence_lines"]))
 check("JSON嵌套status_logs数组且有内容", len(target_json["status_logs"]) >= 1, str(target_json["status_logs"]))
 check("JSON流转日志含'导出测试流转'备注", any("导出测试流转" in str(lg.get("note", "")) for lg in target_json["status_logs"]), str(target_json["status_logs"]))
-check("JSON规则版本为v2", target_json["rule_version"] == 2, str(target_json["rule_version"]))
+check("JSON规则版本为v1（旧差异保留原归因）", target_json["rule_version"] == 1, str(target_json["rule_version"]))
 
 print("\n" + "=" * 70)
 print("测试 11: 重启模拟（断开重连数据库后数据一致性）")

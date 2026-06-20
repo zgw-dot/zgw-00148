@@ -20,9 +20,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 DB_PATH = os.path.join(BASE_DIR, "inventory_diff.db")
 
-if os.path.exists(DB_PATH):
-    os.remove(DB_PATH)
-    print("[清理] 已清空旧数据库")
+from test_utils import init_test_env
+init_test_env(DB_PATH)
 
 from db import (
     init_db, get_conn, get_discrepancies, get_evidence_for_discrepancy,

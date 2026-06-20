@@ -102,11 +102,25 @@ with tab1:
         st.divider()
         st.subheader("测试坏行导入")
         bad_path = os.path.join(SAMPLE_DIR, "inventory_with_bad_rows.csv")
+        bad_sales_path = os.path.join(SAMPLE_DIR, "sales_with_bad_rows.csv")
         if os.path.exists(bad_path):
             with open(bad_path, "rb") as f:
                 bad_content = f.read()
-            if st.button("🧪 导入坏行测试文件", key="bad_test"):
+            if st.button("🧪 导入坏行库存测试文件", key="bad_test"):
                 result = import_csv("inventory", "inventory_with_bad_rows.csv", bad_content)
+                if result["success"]:
+                    st.success(f"✅ 部分成功: 有效 {result['valid_rows']} 行, 跳过 {result['error_rows']} 行")
+                    for e in result.get("detail_errors", []):
+                        st.error(e)
+                else:
+                    st.error(f"❌ {result['error']}")
+                    for e in result.get("detail_errors", []):
+                        st.error(e)
+        if os.path.exists(bad_sales_path):
+            with open(bad_sales_path, "rb") as f:
+                bad_sales_content = f.read()
+            if st.button("🧪 导入坏行销售测试文件", key="bad_sales_test"):
+                result = import_csv("sales", "sales_with_bad_rows.csv", bad_sales_content)
                 if result["success"]:
                     st.success(f"✅ 部分成功: 有效 {result['valid_rows']} 行, 跳过 {result['error_rows']} 行")
                     for e in result.get("detail_errors", []):
@@ -316,6 +330,7 @@ with tab4:
 # ── Tab 5: 导出 ──
 with tab5:
     st.header("导出数据")
+    st.markdown("导出包含**差异明细、复核备注、来源证据行、状态流转日志**，可独立复盘。")
 
     with get_conn() as conn:
         stores = get_stores(conn)
@@ -328,18 +343,47 @@ with tab5:
         discs = get_discrepancies(conn, store_id=store_param)
 
     if discs:
-        df_export = pd.DataFrame(discs)
-        display_cols = [
+        with get_conn() as conn:
+            for d in discs:
+                d["evidence_lines"] = get_evidence_for_discrepancy(conn, d["id"])
+                d["status_logs"] = get_status_log(conn, d["id"])
+
+        for d in discs:
+            d["status_label"] = STATUS_LABELS.get(d["status"], d["status"])
+            d["cause_label"] = CAUSE_LABELS.get(d["attributed_cause"], d["attributed_cause"] or "未归因")
+            ev_parts = []
+            for ev in d["evidence_lines"]:
+                tl = {"inventory": "库存", "sales": "销售", "transfer": "调拨", "stocktake": "盘点"}.get(
+                    ev.get("source_type", ""), ev.get("source_type", "")
+                )
+                ev_parts.append(f"[{tl}] 行{ev.get('source_line', '?')}: {ev.get('description', '') or json.loads(ev.get('raw_row', '{}'))}")
+            d["evidence_summary"] = " | ".join(ev_parts) if ev_parts else ""
+            log_parts = []
+            for lg in d["status_logs"]:
+                from_l = STATUS_LABELS.get(lg["from_status"], lg["from_status"] or "新建")
+                to_l = STATUS_LABELS.get(lg["to_status"], lg["to_status"])
+                note = f" ({lg.get('note', '')})" if lg.get("note") else ""
+                log_parts.append(f"{lg['changed_at'][:19]}: {from_l} → {to_l}{note}")
+            d["status_log_summary"] = " | ".join(log_parts) if log_parts else ""
+
+        export_cols = [
             "id", "store_id", "barcode", "sku_name", "system_qty", "actual_qty",
-            "diff_qty", "attributed_cause", "cause_detail", "rule_ver", "status",
-            "review_note", "reviewed_at", "created_at",
+            "diff_qty", "attributed_cause", "cause_label", "cause_detail",
+            "rule_ver", "status", "status_label",
+            "review_note", "reviewed_at", "created_at", "updated_at",
+            "evidence_summary", "status_log_summary",
         ]
-        existing_cols = [c for c in display_cols if c in df_export.columns]
+
+        df_export = pd.DataFrame(discs)
+        existing_cols = [c for c in export_cols if c in df_export.columns]
         df_display = df_export[existing_cols].copy()
-        df_display["status"] = df_display["status"].map(STATUS_LABELS)
-        df_display["attributed_cause"] = df_display["attributed_cause"].map(
-            lambda x: CAUSE_LABELS.get(x, x)
-        )
+        df_display.columns = [
+            "差异ID", "门店", "条码", "商品名称", "系统数量", "实际数量",
+            "差异数量", "归因编码", "归因", "归因详情",
+            "规则版本", "状态编码", "状态",
+            "复核备注", "复核时间", "创建时间", "更新时间",
+            "来源证据", "状态流转",
+        ]
 
         st.dataframe(df_display, use_container_width=True, hide_index=True)
 
@@ -347,17 +391,60 @@ with tab5:
             csv_buf = io.StringIO()
             df_display.to_csv(csv_buf, index=False, encoding="utf-8-sig")
             st.download_button(
-                "⬇️ 下载 CSV",
+                "⬇️ 下载 CSV（含证据+流转+备注）",
                 data=csv_buf.getvalue().encode("utf-8-sig"),
-                file_name=f"discrepancies_{now_iso()[:10]}.csv",
+                file_name=f"discrepancies_full_{now_iso()[:10]}.csv",
                 mime="text/csv",
             )
         else:
-            json_str = json.dumps(discs, ensure_ascii=False, indent=2, default=str)
+            json_obj = []
+            for d in discs:
+                json_obj.append({
+                    "id": d["id"],
+                    "store_id": d["store_id"],
+                    "barcode": d["barcode"],
+                    "sku_name": d["sku_name"],
+                    "system_qty": d["system_qty"],
+                    "actual_qty": d["actual_qty"],
+                    "diff_qty": d["diff_qty"],
+                    "attributed_cause": d["attributed_cause"],
+                    "cause_label": d["cause_label"],
+                    "cause_detail": d.get("cause_detail"),
+                    "rule_version": d.get("rule_ver"),
+                    "status": d["status"],
+                    "status_label": d["status_label"],
+                    "review_note": d.get("review_note"),
+                    "reviewed_at": d.get("reviewed_at"),
+                    "created_at": d.get("created_at"),
+                    "updated_at": d.get("updated_at"),
+                    "evidence_lines": [
+                        {
+                            "source_type": ev.get("source_type"),
+                            "source_line": ev.get("source_line"),
+                            "evidence_type": ev.get("evidence_type"),
+                            "description": ev.get("description"),
+                            "raw_row": json.loads(ev["raw_row"]) if ev.get("raw_row") else None,
+                        }
+                        for ev in d["evidence_lines"]
+                    ],
+                    "status_logs": [
+                        {
+                            "from_status": lg.get("from_status"),
+                            "from_status_label": STATUS_LABELS.get(lg["from_status"], lg["from_status"] or "新建"),
+                            "to_status": lg.get("to_status"),
+                            "to_status_label": STATUS_LABELS.get(lg["to_status"], lg["to_status"]),
+                            "changed_at": lg.get("changed_at"),
+                            "changed_by": lg.get("changed_by"),
+                            "note": lg.get("note"),
+                        }
+                        for lg in d["status_logs"]
+                    ],
+                })
+            json_str = json.dumps(json_obj, ensure_ascii=False, indent=2, default=str)
             st.download_button(
-                "⬇️ 下载 JSON",
+                "⬇️ 下载 JSON（嵌套证据+流转+备注）",
                 data=json_str.encode("utf-8"),
-                file_name=f"discrepancies_{now_iso()[:10]}.json",
+                file_name=f"discrepancies_full_{now_iso()[:10]}.json",
                 mime="application/json",
             )
     else:

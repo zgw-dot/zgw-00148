@@ -1,7 +1,7 @@
 import json
 from datetime import datetime, timedelta
 from db import (
-    get_conn, now_iso, get_active_rule_version,
+    get_conn, now_iso, get_active_rule_version, clear_all_discrepancies,
 )
 from import_service import get_inventory_data, get_stocktake_data, get_sales_data, get_transfer_data
 
@@ -55,6 +55,8 @@ def run_attribution():
 
         if not inv_data or not stk_data:
             return {"success": False, "error": "需要至少导入一份库存文件和一份盘点文件才能归因"}
+
+        clear_all_discrepancies(conn)
 
         inv_map = {}
         for r in inv_data:
@@ -133,14 +135,6 @@ def run_attribution():
                 stk_map.get(key, {}).get("raw_ids", []),
                 aliases,
             )
-
-            existing = conn.execute(
-                "SELECT id FROM discrepancies WHERE store_id = ? AND barcode = ? AND status != 'closed'",
-                (store_id, barcode),
-            ).fetchone()
-
-            if existing:
-                continue
 
             conn.execute(
                 """INSERT INTO discrepancies

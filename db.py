@@ -274,3 +274,9 @@ def get_import_records(conn):
         "SELECT * FROM import_records ORDER BY imported_at DESC"
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def clear_all_discrepancies(conn):
+    conn.execute("DELETE FROM status_log")
+    conn.execute("DELETE FROM evidence_lines")
+    conn.execute("DELETE FROM discrepancies")

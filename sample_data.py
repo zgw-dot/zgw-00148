@@ -46,6 +46,14 @@ BAD_ROWS_INVENTORY = [
     {"store_id": "S003", "barcode": "6901234567900", "sku_name": "正常商品", "system_qty": 15},
 ]
 
+BAD_ROWS_SALES = [
+    {"store_id": "S003", "barcode": "", "sku_name": "销售缺条码", "sale_qty": 3, "sale_date": "2025-06-20"},
+    {"store_id": "S003", "barcode": "6901234567901", "sku_name": "销售缺数量", "sale_qty": "", "sale_date": "2025-06-20"},
+    {"store_id": "S003", "barcode": "6901234567902", "sku_name": "销售数量非数值", "sale_qty": "abc", "sale_date": "2025-06-20"},
+    {"store_id": "S003", "barcode": "6901234567903", "sku_name": "销售缺日期", "sale_qty": 5, "sale_date": ""},
+    {"store_id": "S003", "barcode": "6901234567904", "sku_name": "销售正常行", "sale_qty": 7, "sale_date": "2025-06-20"},
+]
+
 
 def _write_csv(filepath, rows):
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
@@ -63,4 +71,5 @@ def generate_sample_data():
     _write_csv(os.path.join(SAMPLE_DIR, "transfer.csv"), TRANSFER_ROWS)
     _write_csv(os.path.join(SAMPLE_DIR, "stocktake.csv"), STOCKTAKE_ROWS)
     _write_csv(os.path.join(SAMPLE_DIR, "inventory_with_bad_rows.csv"), BAD_ROWS_INVENTORY)
+    _write_csv(os.path.join(SAMPLE_DIR, "sales_with_bad_rows.csv"), BAD_ROWS_SALES)
     return SAMPLE_DIR

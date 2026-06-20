@@ -11,7 +11,7 @@ REQUIRED_FIELDS = {
     "stocktake": ["store_id", "barcode", "actual_qty"],
 }
 
-QTY_FIELDS = {
+NUMERIC_FIELDS = {
     "inventory": ["system_qty"],
     "sales": ["sale_qty"],
     "transfer": ["transfer_qty"],
@@ -23,22 +23,32 @@ def compute_file_hash(content_bytes):
     return hashlib.sha256(content_bytes).hexdigest()
 
 
+def _normalize_val(val):
+    if val is None:
+        return None
+    if isinstance(val, str):
+        stripped = val.strip()
+        return stripped if stripped != "" else None
+    return val
+
+
 def validate_row(import_type, row, line_num):
     errors = []
     required = REQUIRED_FIELDS.get(import_type, [])
     for field in required:
-        val = row.get(field, "").strip() if isinstance(row.get(field), str) else row.get(field)
-        if val is None or (isinstance(val, str) and val.strip() == ""):
+        val = _normalize_val(row.get(field))
+        if val is None:
             errors.append(f"第 {line_num} 行: 缺少必填字段 '{field}'")
 
-    qty_fields = QTY_FIELDS.get(import_type, [])
-    for field in qty_fields:
-        val = row.get(field, "").strip() if isinstance(row.get(field), str) else row.get(field)
-        if val is not None and str(val).strip() != "":
-            try:
-                float(val)
-            except (ValueError, TypeError):
-                errors.append(f"第 {line_num} 行: 字段 '{field}' 的值 '{val}' 不是有效数值")
+    numeric_fields = NUMERIC_FIELDS.get(import_type, [])
+    for field in numeric_fields:
+        raw = _normalize_val(row.get(field))
+        if raw is None:
+            continue
+        try:
+            float(raw)
+        except (ValueError, TypeError):
+            errors.append(f"第 {line_num} 行: 字段 '{field}' 的值 '{raw}' 不是有效数值")
 
     return errors
 

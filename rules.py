@@ -22,7 +22,8 @@ def save_rule_config(new_config):
         return {
             "success": True,
             "version": ver,
-            "message": f"规则 v{ver} 保存成功，已按新规则重算 {attr_result.get('created', 0)} 条差异",
+            "message": (f"规则 v{ver} 保存成功，新增 {attr_result.get('created', 0)} 条差异"
+                        f"（已有 {attr_result.get('skipped', 0)} 条差异保留原归因快照不变）"),
             "recomputed": attr_result,
         }
     else:

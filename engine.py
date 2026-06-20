@@ -2,8 +2,7 @@ import json
 from datetime import datetime, timedelta
 from db import (
     get_conn, now_iso, get_active_rule_version, clear_all_discrepancies,
-    get_discrepancy_by_business_key, delete_evidence_for_discrepancy,
-    delete_snapshots_for_discrepancy, insert_attribution_snapshot, insert_calc_step,
+    get_discrepancy_by_business_key, insert_attribution_snapshot, insert_calc_step,
 )
 from import_service import get_inventory_data, get_stocktake_data, get_sales_data, get_transfer_data
 
@@ -124,7 +123,7 @@ def run_attribution():
 
         all_keys = set(inv_map.keys()) | set(stk_map.keys())
         created = 0
-        updated = 0
+        skipped = 0
         now_str = now_iso()
 
         for key in all_keys:
@@ -143,6 +142,11 @@ def run_attribution():
             alias_before = ", ".join(sorted([b for b in all_raw_bc if b != barcode])) or None
             alias_after = barcode if alias_before else None
 
+            existing = get_discrepancy_by_business_key(conn, store_id, barcode)
+            if existing:
+                skipped += 1
+                continue
+
             cause, cause_detail, evidence, calc_steps = _attribute(
                 key, diff, sys_qty, act_qty, loss_pct, loss_abs,
                 sales_by_key.get(key), transfers_by_key.get(key),
@@ -151,38 +155,20 @@ def run_attribution():
                 aliases,
             )
 
-            existing = get_discrepancy_by_business_key(conn, store_id, barcode)
-            if existing:
-                disc_id = existing["id"]
-                delete_evidence_for_discrepancy(conn, disc_id)
-                delete_snapshots_for_discrepancy(conn, disc_id)
-                conn.execute(
-                    """UPDATE discrepancies SET
-                       sku_name = ?, system_qty = ?, actual_qty = ?, diff_qty = ?,
-                       attributed_cause = ?, cause_detail = ?, rule_version_id = ?,
-                       updated_at = ?
-                       WHERE id = ?""",
-                    (
-                        sku_name, sys_qty, act_qty, diff, cause, cause_detail,
-                        rule_rec["id"], now_str, disc_id,
-                    ),
-                )
-                updated += 1
-            else:
-                conn.execute(
-                    """INSERT INTO discrepancies
-                       (store_id, barcode, sku_name, system_qty, actual_qty, diff_qty,
-                        attributed_cause, cause_detail, rule_version_id, import_id, status,
-                        review_note, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        store_id, barcode, sku_name, sys_qty, act_qty, diff,
-                        cause, cause_detail, rule_rec["id"], None,
-                        "pending_review", None, now_str, now_str,
-                    ),
-                )
-                disc_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-                created += 1
+            conn.execute(
+                """INSERT INTO discrepancies
+                   (store_id, barcode, sku_name, system_qty, actual_qty, diff_qty,
+                    attributed_cause, cause_detail, rule_version_id, import_id, status,
+                    review_note, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    store_id, barcode, sku_name, sys_qty, act_qty, diff,
+                    cause, cause_detail, rule_rec["id"], None,
+                    "pending_review", None, now_str, now_str,
+                ),
+            )
+            disc_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            created += 1
 
             for ev in evidence:
                 conn.execute(
@@ -215,7 +201,7 @@ def run_attribution():
         return {
             "success": True,
             "created": created,
-            "updated": updated,
+            "skipped": skipped,
             "total_keys": len(all_keys),
             "rule_version": rule_rec["version"],
         }

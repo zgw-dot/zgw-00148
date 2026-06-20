@@ -165,7 +165,10 @@ with tab2:
         with st.spinner("正在归因分析..."):
             result = run_attribution()
         if result["success"]:
-            st.success(f"✅ 归因完成！新建差异 {result['created']} 条，使用规则 v{result['rule_version']}")
+            msg = f"✅ 归因完成！新增差异 {result['created']} 条，使用规则 v{result['rule_version']}"
+            if result.get("skipped", 0) > 0:
+                msg += f"（已有 {result['skipped']} 条差异保留原归因快照不变）"
+            st.success(msg)
         else:
             st.error(f"❌ {result['error']}")
 

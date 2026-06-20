@@ -174,7 +174,7 @@ print(f"  [INFO] 规则变更前差异ID集合: {sorted(ids_before_rule)}")
 
 
 print("\n" + "=" * 70)
-print("测试 4: 规则变更 → 老差异保留ID/状态/备注/日志，仅计算字段刷新")
+print("测试 4: 规则变更 → 老差异保留原始快照/阈值/归因（不可变）")
 print("=" * 70)
 NEW_CFG = {
     "loss_threshold_pct": 8.0,
@@ -185,8 +185,9 @@ NEW_CFG = {
 r_save = save_rule_config(NEW_CFG)
 check(f"新规则保存成功 {r_save.get('message')}", r_save["success"], str(r_save))
 check("规则版本号递增（v2）", "v2" in r_save.get("message", "") or r_save.get("version") == 2, str(r_save))
-check("重算结果有updated>0（保留老差异更新）", (r_save.get("recomputed") or {}).get("updated", 0) > 0 or
-      (r_save.get("recomputed") or {}).get("created", 0) > 0, str(r_save.get("recomputed")))
+check("重算结果已有差异被跳过（skipped>0）",
+      (r_save.get("recomputed") or {}).get("skipped", 0) > 0,
+      str(r_save.get("recomputed")))
 
 with get_conn() as conn:
     discs_v2 = get_discrepancies(conn)
@@ -216,20 +217,20 @@ check(f"样本差异created_at时间戳未变（不是新插入）",
 check(f"样本差异流转日志仍有2条（未被清空）",
       len(logs_v2_sample) == 2, f"日志数={len(logs_v2_sample)} 详情={logs_v2_sample}")
 
-check(f"样本差异规则版本更新为v2",
-      d2_sample.get("rule_ver") == 2,
+check(f"样本差异规则版本仍为v1（不被覆盖为v2）",
+      d2_sample.get("rule_ver") == 1,
       f"rule_ver={d2_sample.get('rule_ver')}")
-check(f"样本差异快照已重新生成（规则配置含新阈值8%）",
+check(f"样本差异快照仍保留v1原始配置（阈值=2.0，不是8%）",
       snap_v2 is not None and
-      (snap_v2.get("rule_config_snapshot") or {}).get("loss_threshold_pct") == 8.0,
+      (snap_v2.get("rule_config_snapshot") or {}).get("loss_threshold_pct") == 2.0,
       f"snap_cfg={snap_v2.get('rule_config_snapshot') if snap_v2 else '无快照'}")
-check(f"样本差异计算步骤已刷新（至少2步）",
+check(f"样本差异计算步骤仍保留v1原始步骤（至少2步）",
       len(steps_v2) >= 2, f"steps={len(steps_v2)}")
 
 d2_others = [d for d in discs_v2 if d["id"] != sample_id_v1]
 if d2_others:
-    check(f"其他差异也已绑定规则v2",
-          all(d.get("rule_ver") == 2 for d in d2_others),
+    check(f"其他差异规则版本仍为v1（不被覆盖）",
+          all(d.get("rule_ver") == 1 for d in d2_others),
           str([(d["id"], d.get("rule_ver")) for d in d2_others]))
 
 
@@ -268,8 +269,8 @@ if calc_steps:
     ], ensure_ascii=False)
 
 check("CSV列 快照-别名映射 存在（非空提示）", len(csv_alias_col) > 0, csv_alias_col)
-check("CSV列 快照-当时规则配置(JSON) 含loss_threshold_pct",
-      "loss_threshold_pct" in csv_rule_cfg_col and "8.0" in csv_rule_cfg_col, csv_rule_cfg_col)
+check("CSV列 快照-当时规则配置(JSON) 含loss_threshold_pct(=2.0)",
+      "loss_threshold_pct" in csv_rule_cfg_col and "2.0" in csv_rule_cfg_col, csv_rule_cfg_col)
 check("CSV列 计算步骤(JSON) 有步骤且非空",
       len(calc_steps) >= 2 and len(csv_calc_col) > 50,
       f"步骤数={len(calc_steps)} JSON长度={len(csv_calc_col)}")
@@ -315,8 +316,8 @@ sample_json = next(j for j in json_obj if j["id"] == sample_id_v1)
 check("JSON嵌套 attribution_snapshot 不为None", sample_json["attribution_snapshot"] is not None,
       str(sample_json.get("attribution_snapshot")))
 if sample_json["attribution_snapshot"]:
-    check("JSON快照 规则配置含loss_threshold_pct=8",
-          sample_json["attribution_snapshot"]["rule_config_snapshot"].get("loss_threshold_pct") == 8.0,
+    check("JSON快照 规则配置含loss_threshold_pct=2(原始v1值)",
+          sample_json["attribution_snapshot"]["rule_config_snapshot"].get("loss_threshold_pct") == 2.0,
           str(sample_json["attribution_snapshot"]["rule_config_snapshot"]))
     check("JSON快照 system/actual/diff数值正确",
           sample_json["attribution_snapshot"]["diff_qty_snapshot"] is not None,
@@ -391,8 +392,8 @@ check(f"重连后样本差异复核备注完整保留",
       d_reconnect.get("review_note") == NOTE_TEXT_V1, d_reconnect.get("review_note"))
 check(f"重连后样本差异快照仍然存在", snap_reconnect is not None)
 if snap_reconnect:
-    check(f"重连后快照规则配置loss_threshold_pct=8",
-          (snap_reconnect.get("rule_config_snapshot") or {}).get("loss_threshold_pct") == 8.0)
+    check(f"重连后快照规则配置loss_threshold_pct=2(v1原始值)",
+          (snap_reconnect.get("rule_config_snapshot") or {}).get("loss_threshold_pct") == 2.0)
 check(f"重连后计算步骤数一致 {len(steps_reconnect)}=={len(steps_v2)}",
       len(steps_reconnect) == len(steps_v2))
 check(f"重连后流转日志仍2条", len(logs_reconnect) == 2)

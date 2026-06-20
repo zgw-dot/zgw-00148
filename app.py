@@ -19,6 +19,7 @@ from db import (
     get_review_scheme_by_name, update_review_scheme_name, delete_review_scheme,
     copy_review_scheme, mark_scheme_used, get_last_used_scheme,
     check_data_date_range_changed, get_scheme_operation_logs, log_scheme_operation,
+    export_scheme_package, validate_scheme_package, import_scheme_package,
 )
 from import_service import import_csv
 from engine import run_attribution, CAUSE_LABELS
@@ -976,6 +977,125 @@ with tab6:
                         del st.session_state.show_delete_dialog
                         st.rerun()
 
+    st.divider()
+    st.subheader("📦 方案包导入/导出")
+
+    pkg_col1, pkg_col2 = st.columns(2)
+    with pkg_col1:
+        st.markdown("**导出方案包**")
+        with get_conn() as conn:
+            exportable_schemes = get_review_schemes(conn)
+        if exportable_schemes:
+            export_scope = st.radio(
+                "导出范围",
+                ["当前方案", "全部方案"],
+                horizontal=True,
+                key="export_scheme_scope",
+            )
+            export_scheme_ids = None
+            if export_scope == "当前方案":
+                cid = st.session_state.get("current_scheme_id")
+                if cid:
+                    export_scheme_ids = [cid]
+                else:
+                    st.warning("当前未选择方案，请先选择或载入一个方案")
+            if export_scope == "全部方案" or (export_scope == "当前方案" and export_scheme_ids):
+                with get_conn() as conn:
+                    pkg = export_scheme_package(conn, scheme_ids=export_scheme_ids)
+                pkg_json = json.dumps(pkg, ensure_ascii=False, indent=2, default=str)
+                scope_label = export_scope
+                if export_scope == "当前方案":
+                    scope_label = st.session_state.get("current_scheme_name", "当前方案")
+                pkg_file_name = f"scheme_package_{scope_label}_{now_iso()[:10]}.json"
+                pkg_file_name = pkg_file_name.replace(" ", "_").replace("/", "_")
+                st.download_button(
+                    "⬇️ 下载方案包 JSON",
+                    data=pkg_json.encode("utf-8"),
+                    file_name=pkg_file_name,
+                    mime="application/json",
+                    key="download_scheme_package",
+                )
+                st.caption(f"包含 {pkg['scheme_count']} 个方案，导出时间: {pkg['exported_at'][:19]}")
+        else:
+            st.info("暂无方案可导出")
+
+    with pkg_col2:
+        st.markdown("**导入方案包**")
+        uploaded_pkg = st.file_uploader("上传方案包 JSON 文件", type=["json"], key="upload_scheme_package")
+        if uploaded_pkg:
+            try:
+                pkg_content = uploaded_pkg.read().decode("utf-8")
+                parsed_pkg = json.loads(pkg_content)
+            except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                parsed_pkg = None
+                st.error(f"❌ 文件解析失败: {e}")
+
+            if parsed_pkg is not None:
+                validation = validate_scheme_package(parsed_pkg)
+                if not validation["valid"]:
+                    st.error(f"❌ 方案包校验失败: {validation['error']}")
+                else:
+                    st.success(f"✅ 方案包校验通过，包含 {validation['scheme_count']} 个方案")
+
+                    pkg_names = [s["name"] for s in parsed_pkg["schemes"]]
+                    with get_conn() as conn:
+                        existing_names = set(s["name"] for s in get_review_schemes(conn))
+                    conflicts = [n for n in pkg_names if n in existing_names]
+
+                    if conflicts:
+                        st.warning(f"⚠️ 以下方案名已存在: {', '.join(conflicts)}")
+                        conflict_policy = st.radio(
+                            "重名冲突处理方式",
+                            ["保留原方案（跳过）", "覆盖已有方案", "改名导入"],
+                            key="import_conflict_policy",
+                        )
+                        policy_map = {
+                            "保留原方案（跳过）": "keep",
+                            "覆盖已有方案": "overwrite",
+                            "改名导入": "rename",
+                        }
+                        selected_policy = policy_map[conflict_policy]
+                    else:
+                        selected_policy = "keep"
+
+                    rename_suffix = None
+                    if selected_policy == "rename":
+                        rename_suffix = st.text_input(
+                            "改名后缀",
+                            value="(导入)",
+                            key="import_rename_suffix",
+                        )
+
+                    if st.button("📥 确认导入", type="primary", key="confirm_import_scheme"):
+                        with get_conn() as conn:
+                            result = import_scheme_package(
+                                conn, parsed_pkg,
+                                conflict_policy=selected_policy,
+                                rename_suffix=rename_suffix,
+                            )
+                        if result["success"]:
+                            st.success(
+                                f"✅ 导入完成！成功 {result['imported_count']} 个，"
+                                f"跳过 {result['skipped_count']} 个，共 {result['total']} 个"
+                            )
+                            for r in result["results"]:
+                                action_labels = {
+                                    "created": "新建",
+                                    "overwritten": "覆盖",
+                                    "renamed": "改名导入",
+                                    "kept": "保留原方案",
+                                }
+                                label = action_labels.get(r["action"], r["action"])
+                                if r["action"] == "renamed":
+                                    st.info(f"📦 '{r.get('original_name', r['name'])}' → '{r['name']}' ({label})")
+                                elif r["action"] == "kept":
+                                    st.info(f"📦 '{r['name']}' ({label})")
+                                else:
+                                    st.info(f"📦 '{r['name']}' ({label})")
+                            st.rerun()
+                        else:
+                            st.error(f"❌ 导入失败: {result['error']}")
+
     with st.expander("📜 操作日志（最近50条）", expanded=False):
         if operation_logs:
             log_df = pd.DataFrame(operation_logs)
@@ -985,6 +1105,8 @@ with tab6:
             type_labels = {
                 "create": "新建", "update": "更新", "rename": "改名",
                 "copy": "复制", "delete": "删除", "load": "载入",
+                "export": "导出", "export_scheme": "导出方案包",
+                "import_scheme": "导入方案包",
             }
             log_df["操作类型"] = log_df["操作类型"].map(type_labels).fillna(log_df["操作类型"])
             st.dataframe(log_df, use_container_width=True, hide_index=True)

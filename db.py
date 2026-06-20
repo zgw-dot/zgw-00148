@@ -931,6 +931,225 @@ def log_scheme_operation(conn, scheme_id, scheme_name, operation_type, operation
     )
 
 
+SCHEME_PACKAGE_VERSION = "1.0"
+
+SCHEME_PACKAGE_REQUIRED_KEYS = {"version", "exported_at", "schemes"}
+
+SCHEME_PACKAGE_SCHEME_REQUIRED_KEYS = {"name", "filter_state"}
+
+
+def export_scheme_package(conn, scheme_ids=None):
+    now = now_iso()
+    if scheme_ids is None:
+        rows = conn.execute("SELECT * FROM review_schemes ORDER BY COALESCE(last_used_at, updated_at) DESC").fetchall()
+    else:
+        placeholders = ",".join("?" for _ in scheme_ids)
+        rows = conn.execute(
+            f"SELECT * FROM review_schemes WHERE id IN ({placeholders})",
+            list(scheme_ids),
+        ).fetchall()
+
+    schemes = []
+    for r in rows:
+        d = dict(r)
+        try:
+            filter_state = json.loads(d["filter_state_json"]) if d.get("filter_state_json") else {}
+        except (TypeError, json.JSONDecodeError):
+            filter_state = {}
+        try:
+            data_date_range = json.loads(d["data_date_range_json"]) if d.get("data_date_range_json") else None
+        except (TypeError, json.JSONDecodeError):
+            data_date_range = None
+        schemes.append({
+            "name": d["name"],
+            "description": d.get("description"),
+            "filter_state": filter_state,
+            "data_date_range": data_date_range,
+            "created_at": d["created_at"],
+            "updated_at": d["updated_at"],
+        })
+
+    package = {
+        "version": SCHEME_PACKAGE_VERSION,
+        "exported_at": now,
+        "scheme_count": len(schemes),
+        "schemes": schemes,
+    }
+
+    scheme_names = [s["name"] for s in schemes]
+    scheme_id_list = [dict(r)["id"] for r in rows] if rows else []
+    for sid in scheme_id_list:
+        log_scheme_operation(
+            conn, sid, schemes[scheme_id_list.index(sid)]["name"] if scheme_id_list else "",
+            "export_scheme",
+            f"导出方案包，包含{len(schemes)}个方案: {', '.join(scheme_names)}",
+        )
+
+    return package
+
+
+def validate_scheme_package(package):
+    if not isinstance(package, dict):
+        return {"valid": False, "error": "方案包必须是JSON对象"}
+
+    missing = [k for k in SCHEME_PACKAGE_REQUIRED_KEYS if k not in package]
+    if missing:
+        return {"valid": False, "error": f"方案包缺少必填字段: {', '.join(missing)}"}
+
+    version = package.get("version")
+    if not isinstance(version, str):
+        return {"valid": False, "error": "方案包version字段必须为字符串"}
+
+    schemes = package.get("schemes")
+    if not isinstance(schemes, list):
+        return {"valid": False, "error": "方案包schemes字段必须为数组"}
+
+    if len(schemes) == 0:
+        return {"valid": False, "error": "方案包schemes不能为空"}
+
+    for i, s in enumerate(schemes):
+        if not isinstance(s, dict):
+            return {"valid": False, "error": f"第{i+1}个方案必须是对象"}
+        missing_s = [k for k in SCHEME_PACKAGE_SCHEME_REQUIRED_KEYS if k not in s]
+        if missing_s:
+            return {"valid": False, "error": f"第{i+1}个方案缺少必填字段: {', '.join(missing_s)}"}
+        if not isinstance(s["name"], str) or not s["name"].strip():
+            return {"valid": False, "error": f"第{i+1}个方案的name必须为非空字符串"}
+        if not isinstance(s["filter_state"], dict):
+            return {"valid": False, "error": f"第{i+1}个方案的filter_state必须为对象"}
+
+    return {"valid": True, "scheme_count": len(schemes)}
+
+
+def import_scheme_package(conn, package, conflict_policy="keep", rename_suffix=None):
+    validation = validate_scheme_package(package)
+    if not validation["valid"]:
+        return {"success": False, "error": validation["error"]}
+
+    schemes = package["schemes"]
+    results = []
+    imported_count = 0
+    skipped_count = 0
+
+    for s in schemes:
+        name = s["name"]
+        description = s.get("description")
+        filter_state = s["filter_state"]
+        data_date_range = s.get("data_date_range")
+
+        existing = conn.execute(
+            "SELECT * FROM review_schemes WHERE name = ?", (name,)
+        ).fetchone()
+
+        if existing:
+            if conflict_policy == "keep":
+                skipped_count += 1
+                results.append({
+                    "name": name,
+                    "action": "kept",
+                    "reason": f"方案名 '{name}' 已存在，保留原方案",
+                })
+                log_scheme_operation(
+                    conn, dict(existing)["id"], name, "import_scheme",
+                    f"导入方案包跳过(保留原方案): '{name}'",
+                )
+                continue
+            elif conflict_policy == "overwrite":
+                now = now_iso()
+                filter_json = json.dumps(filter_state, ensure_ascii=False)
+                date_range_json = json.dumps(data_date_range, ensure_ascii=False) if data_date_range else None
+                conn.execute(
+                    """UPDATE review_schemes
+                       SET description = ?, filter_state_json = ?, data_date_range_json = ?,
+                           updated_at = ?
+                       WHERE name = ?""",
+                    (description, filter_json, date_range_json, now, name),
+                )
+                row = conn.execute("SELECT * FROM review_schemes WHERE name = ?", (name,)).fetchone()
+                scheme_id = row["id"]
+                imported_count += 1
+                results.append({
+                    "name": name,
+                    "action": "overwritten",
+                    "scheme_id": scheme_id,
+                })
+                log_scheme_operation(
+                    conn, scheme_id, name, "import_scheme",
+                    f"导入方案包覆盖: '{name}'",
+                )
+                continue
+            elif conflict_policy == "rename":
+                suffix = rename_suffix or "(导入)"
+                new_name = f"{name}{suffix}"
+                counter = 1
+                while conn.execute(
+                    "SELECT 1 FROM review_schemes WHERE name = ?", (new_name,)
+                ).fetchone():
+                    new_name = f"{name}{suffix}_{counter}"
+                    counter += 1
+                now = now_iso()
+                filter_json = json.dumps(filter_state, ensure_ascii=False)
+                date_range_json = json.dumps(data_date_range, ensure_ascii=False) if data_date_range else None
+                conn.execute(
+                    """INSERT INTO review_schemes
+                       (name, description, filter_state_json, data_date_range_json,
+                        created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (new_name, description, filter_json, date_range_json, now, now),
+                )
+                row = conn.execute("SELECT * FROM review_schemes WHERE name = ?", (new_name,)).fetchone()
+                scheme_id = row["id"]
+                imported_count += 1
+                results.append({
+                    "name": new_name,
+                    "original_name": name,
+                    "action": "renamed",
+                    "scheme_id": scheme_id,
+                })
+                log_scheme_operation(
+                    conn, scheme_id, new_name, "import_scheme",
+                    f"导入方案包改名: '{name}' -> '{new_name}'",
+                )
+                continue
+            else:
+                return {
+                    "success": False,
+                    "error": f"未知的冲突处理策略: {conflict_policy}",
+                    "results": results,
+                }
+        else:
+            now = now_iso()
+            filter_json = json.dumps(filter_state, ensure_ascii=False)
+            date_range_json = json.dumps(data_date_range, ensure_ascii=False) if data_date_range else None
+            conn.execute(
+                """INSERT INTO review_schemes
+                   (name, description, filter_state_json, data_date_range_json,
+                    created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (name, description, filter_json, date_range_json, now, now),
+            )
+            row = conn.execute("SELECT * FROM review_schemes WHERE name = ?", (name,)).fetchone()
+            scheme_id = row["id"]
+            imported_count += 1
+            results.append({
+                "name": name,
+                "action": "created",
+                "scheme_id": scheme_id,
+            })
+            log_scheme_operation(
+                conn, scheme_id, name, "import_scheme",
+                f"导入方案包新建: '{name}'",
+            )
+
+    return {
+        "success": True,
+        "imported_count": imported_count,
+        "skipped_count": skipped_count,
+        "total": len(schemes),
+        "results": results,
+    }
+
+
 def get_scheme_operation_logs(conn, scheme_id=None, limit=100):
     sql = "SELECT * FROM review_scheme_operations"
     params = []

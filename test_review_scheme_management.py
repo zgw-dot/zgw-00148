@@ -716,7 +716,8 @@ summary_lines2 = [
 full_csv2 = "\n".join(summary_lines2) + csv_content2
 
 check("删除方案后CSV使用(未命名方案)", "方案名称: (未命名方案)" in full_csv2, full_csv2[:200])
-check("删除方案后scheme_name列为空", '""' in full_csv2.split("\n")[7] or ",," in full_csv2.split("\n")[7], full_csv2.split("\n")[7])
+row1_test14 = full_csv2.split("\n")[7] if len(full_csv2.split("\n")) > 7 else full_csv2.split("\n")[-1]
+check("删除方案后scheme_name列为空", row1_test14.startswith(",") or '""' in row1_test14, row1_test14)
 
 json_export_no_scheme = {
     "export_metadata": export_filter_summary_no_scheme,
@@ -780,25 +781,90 @@ with get_conn() as conn:
     r5 = update_review_scheme_name(conn, copy_full_id, "完整测试方案V2")
 check("5. 改名成功", r5["success"])
 
-print("  [INFO] 步骤6: 验证操作日志完整")
+print("  [INFO] 步骤6: 导出方案（验证export日志）")
+with get_conn() as conn:
+    log_scheme_operation(conn, copy_full_id, "完整测试方案V2", "export",
+                         "完整链路导出测试，共5条商品，格式:CSV+JSON")
+
+print("  [INFO] 步骤7: 验证操作日志完整")
 with get_conn() as conn:
     full_logs = get_scheme_operation_logs(conn)
-    full_types = [l["operation_type"] for l in full_logs if l["scheme_name"] in ("完整测试方案", "完整测试方案V2")]
+    full_types = [l["operation_type"] for l in full_logs
+                  if l["scheme_name"] in ("完整测试方案", "完整测试方案_副本", "完整测试方案V2")]
 
-check("6. 操作日志包含create/update/load/copy/rename",
-      {"create", "update", "load", "copy", "rename"}.issubset(set(full_types)),
-      str(full_types))
+check("7. 操作日志包含create/update/load/copy/rename/export",
+      {"create", "update", "load", "copy", "rename", "export"}.issubset(set(full_types)),
+      str(sorted(set(full_types))))
 
-print("  [INFO] 步骤7: 删除方案")
+with get_conn() as conn:
+    export_logs = [l for l in full_logs if l["operation_type"] == "export" and l["scheme_id"] == copy_full_id]
+check("7b. export日志关联正确的scheme_id和scheme_name",
+      len(export_logs) >= 1 and export_logs[0]["scheme_name"] == "完整测试方案V2",
+      str(export_logs[:1]))
+
+print("  [INFO] 步骤8: 删除方案")
 with get_conn() as conn:
     r6 = delete_review_scheme(conn, copy_full_id)
     r7 = delete_review_scheme(conn, full_id)
-check("7. 删除成功", r6["success"] and r7["success"])
+check("8. 删除成功", r6["success"] and r7["success"])
 
-print("  [INFO] 步骤8: 导出（无方案时）")
+print("  [INFO] 步骤9: 导出（无方案时）验证方案字段为空")
+current_scheme_id_deleted = None
+current_scheme_name_deleted = ""
+
+d1_del = date_range.get("min_date", "") or "不限"
+d2_del = date_range.get("max_date", "") or "不限"
+
+export_summary_del = {
+    "exported_at": now_iso(),
+    "scheme_name": current_scheme_name_deleted or "",
+    "scheme_id": current_scheme_id_deleted or "",
+    "filter_store": sample_store,
+    "filter_date_from": d1_del,
+    "filter_date_to": d2_del,
+}
+
+df_del = pd.DataFrame(all_export_data)
+df_del.insert(0, "scheme_name", current_scheme_name_deleted or "")
+df_del.insert(1, "filter_store", sample_store)
+
+csv_buf_del = io.StringIO()
+df_del.to_csv(csv_buf_del, index=False, encoding="utf-8-sig")
+csv_content_del = csv_buf_del.getvalue()
+
+scheme_display_del = current_scheme_name_deleted or "(未命名方案)"
+summary_lines_del = [
+    "# 差异复盘对比导出",
+    f"# 方案名称: {scheme_display_del}",
+    f"# 时间条件: {d1_del} ~ {d2_del}",
+    f"# 版本摘要: 版本A=v1, 版本B=v2",
+]
+full_csv_del = "\n".join(summary_lines_del) + "\n" + csv_content_del
+
+check("9. 删除方案后CSV注释使用(未命名方案)", "方案名称: (未命名方案)" in full_csv_del, full_csv_del[:300])
+row1_del = csv_content_del.split("\n")[1]
+check("9b. 删除方案后CSV scheme_name列为空字符串", row1_del.startswith(",") or ',,' in row1_del, [row1_del])
+
+json_export_del = {
+    "export_metadata": export_summary_del,
+    "scheme_info": {
+        "scheme_id": current_scheme_id_deleted or "",
+        "scheme_name": current_scheme_name_deleted or "",
+        "time_condition": {"date_from": d1_del, "date_to": d2_del},
+        "version_summary": {"rule_a": "v1", "rule_b": "v2"},
+    },
+    "comparison_data": all_export_data,
+}
+json_parsed_del = json.loads(json.dumps(json_export_del, ensure_ascii=False))
+check("9c. 删除方案后JSON scheme_name为空字符串", json_parsed_del["scheme_info"]["scheme_name"] == "", json_parsed_del["scheme_info"])
+check("9d. 删除方案后JSON scheme_id为空字符串", json_parsed_del["scheme_info"]["scheme_id"] == "", json_parsed_del["scheme_info"])
+
+csv_file_name_del = f"discrepancy_compare_{current_scheme_name_deleted or 'unnamed'}_{now_iso()[:10]}.csv"
+check("9e. 删除方案后文件名使用unnamed", "unnamed" in csv_file_name_del, csv_file_name_del)
+
 with get_conn() as conn:
     remaining = get_review_schemes(conn)
-check("8. 方案已全部清理", len(remaining) == 0 or all(s["name"] != "完整测试方案" for s in remaining), str([s["name"] for s in remaining]))
+check("9f. 方案已全部清理", len(remaining) == 0 or all(s["name"] != "完整测试方案" for s in remaining), str([s["name"] for s in remaining]))
 
 
 print("\n" + "=" * 70)

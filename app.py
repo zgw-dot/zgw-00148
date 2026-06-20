@@ -18,7 +18,7 @@ from db import (
     save_review_scheme, get_review_schemes, get_review_scheme_by_id,
     get_review_scheme_by_name, update_review_scheme_name, delete_review_scheme,
     copy_review_scheme, mark_scheme_used, get_last_used_scheme,
-    check_data_date_range_changed, get_scheme_operation_logs,
+    check_data_date_range_changed, get_scheme_operation_logs, log_scheme_operation,
 )
 from import_service import import_csv
 from engine import run_attribution, CAUSE_LABELS

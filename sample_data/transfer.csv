@@ -1,0 +1,3 @@
+﻿store_id_from,store_id_to,barcode,sku_name,transfer_qty,transfer_date
+S001,S002,6901234567892,薯片原味,10,2025-06-19
+S002,S001,6901234567895,橙汁1L,5,2025-06-20

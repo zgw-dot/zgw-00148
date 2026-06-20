@@ -135,6 +135,28 @@ CREATE TABLE IF NOT EXISTS discrepancy_calc_steps (
     raw_data_ids TEXT,
     FOREIGN KEY (discrepancy_id) REFERENCES discrepancies(id)
 );
+
+CREATE TABLE IF NOT EXISTS review_schemes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    description TEXT,
+    filter_state_json TEXT NOT NULL,
+    data_date_range_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    last_used_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS review_scheme_operations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scheme_id INTEGER,
+    scheme_name TEXT NOT NULL,
+    operation_type TEXT NOT NULL,
+    operation_detail TEXT,
+    operated_at TEXT NOT NULL,
+    operator TEXT DEFAULT 'user',
+    FOREIGN KEY (scheme_id) REFERENCES review_schemes(id)
+);
 """
 
 STATUS_PENDING_REVIEW = "pending_review"
@@ -241,6 +263,48 @@ def _migrate_db(conn):
                 updated_at TEXT NOT NULL
             )
         """)
+
+    for table_name, create_sql in [
+        ("review_schemes", """
+            CREATE TABLE IF NOT EXISTS review_schemes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                description TEXT,
+                filter_state_json TEXT NOT NULL,
+                data_date_range_json TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_used_at TEXT
+            )
+        """),
+        ("review_scheme_operations", """
+            CREATE TABLE IF NOT EXISTS review_scheme_operations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scheme_id INTEGER,
+                scheme_name TEXT NOT NULL,
+                operation_type TEXT NOT NULL,
+                operation_detail TEXT,
+                operated_at TEXT NOT NULL,
+                operator TEXT DEFAULT 'user',
+                FOREIGN KEY (scheme_id) REFERENCES review_schemes(id)
+            )
+        """),
+    ]:
+        exists = conn.execute(
+            f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table_name}'"
+        ).fetchone()
+        if not exists:
+            conn.execute(create_sql)
+        else:
+            cols = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+            col_names = [c["name"] for c in cols]
+            if table_name == "review_schemes":
+                if "description" not in col_names:
+                    conn.execute(f"ALTER TABLE {table_name} ADD COLUMN description TEXT")
+                if "data_date_range_json" not in col_names:
+                    conn.execute(f"ALTER TABLE {table_name} ADD COLUMN data_date_range_json TEXT")
+                if "last_used_at" not in col_names:
+                    conn.execute(f"ALTER TABLE {table_name} ADD COLUMN last_used_at TEXT")
 
 
 def now_iso():
@@ -626,3 +690,254 @@ def get_date_range(conn):
         "SELECT MIN(imported_at) as min_date, MAX(imported_at) as max_date FROM import_records"
     ).fetchone()
     return dict(row) if row else None
+
+
+def save_review_scheme(conn, name, filter_state, description=None, overwrite=False,
+                       data_date_range=None):
+    now = now_iso()
+    existing = conn.execute(
+        "SELECT * FROM review_schemes WHERE name = ?", (name,)
+    ).fetchone()
+
+    if existing and not overwrite:
+        return {
+            "success": False,
+            "error": f"方案名 '{name}' 已存在",
+            "existing": dict(existing),
+            "needs_confirm": True,
+        }
+
+    filter_json = json.dumps(filter_state, ensure_ascii=False)
+    date_range_json = json.dumps(data_date_range, ensure_ascii=False) if data_date_range else None
+
+    if existing:
+        conn.execute(
+            """UPDATE review_schemes
+               SET description = ?, filter_state_json = ?, data_date_range_json = ?,
+                   updated_at = ?
+               WHERE name = ?""",
+            (description, filter_json, date_range_json, now, name),
+        )
+        row = conn.execute("SELECT * FROM review_schemes WHERE name = ?", (name,)).fetchone()
+        scheme_id = row["id"]
+        log_scheme_operation(conn, scheme_id, name, "update",
+                             f"覆盖更新方案，描述: {description or '(无)'}")
+    else:
+        conn.execute(
+            """INSERT INTO review_schemes
+               (name, description, filter_state_json, data_date_range_json,
+                created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (name, description, filter_json, date_range_json, now, now),
+        )
+        row = conn.execute("SELECT * FROM review_schemes WHERE name = ?", (name,)).fetchone()
+        scheme_id = row["id"]
+        log_scheme_operation(conn, scheme_id, name, "create",
+                             f"新建方案，描述: {description or '(无)'}")
+
+    return {
+        "success": True,
+        "scheme_id": scheme_id,
+        "name": name,
+        "overwritten": existing is not None,
+    }
+
+
+def get_review_schemes(conn):
+    rows = conn.execute(
+        "SELECT * FROM review_schemes ORDER BY COALESCE(last_used_at, updated_at) DESC"
+    ).fetchall()
+    results = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["filter_state"] = json.loads(d["filter_state_json"]) if d.get("filter_state_json") else {}
+        except (TypeError, json.JSONDecodeError):
+            d["filter_state"] = {}
+        try:
+            d["data_date_range"] = json.loads(d["data_date_range_json"]) if d.get("data_date_range_json") else None
+        except (TypeError, json.JSONDecodeError):
+            d["data_date_range"] = None
+        results.append(d)
+    return results
+
+
+def get_review_scheme_by_id(conn, scheme_id):
+    row = conn.execute(
+        "SELECT * FROM review_schemes WHERE id = ?", (scheme_id,)
+    ).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    try:
+        d["filter_state"] = json.loads(d["filter_state_json"]) if d.get("filter_state_json") else {}
+    except (TypeError, json.JSONDecodeError):
+        d["filter_state"] = {}
+    try:
+        d["data_date_range"] = json.loads(d["data_date_range_json"]) if d.get("data_date_range_json") else None
+    except (TypeError, json.JSONDecodeError):
+        d["data_date_range"] = None
+    return d
+
+
+def get_review_scheme_by_name(conn, name):
+    row = conn.execute(
+        "SELECT * FROM review_schemes WHERE name = ?", (name,)
+    ).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    try:
+        d["filter_state"] = json.loads(d["filter_state_json"]) if d.get("filter_state_json") else {}
+    except (TypeError, json.JSONDecodeError):
+        d["filter_state"] = {}
+    try:
+        d["data_date_range"] = json.loads(d["data_date_range_json"]) if d.get("data_date_range_json") else None
+    except (TypeError, json.JSONDecodeError):
+        d["data_date_range"] = None
+    return d
+
+
+def update_review_scheme_name(conn, scheme_id, new_name):
+    existing = conn.execute(
+        "SELECT * FROM review_schemes WHERE id = ?", (scheme_id,)
+    ).fetchone()
+    if not existing:
+        return {"success": False, "error": f"方案ID {scheme_id} 不存在"}
+
+    name_exists = conn.execute(
+        "SELECT * FROM review_schemes WHERE name = ? AND id != ?", (new_name, scheme_id)
+    ).fetchone()
+    if name_exists:
+        return {"success": False, "error": f"方案名 '{new_name}' 已存在", "needs_confirm": False}
+
+    old_name = existing["name"]
+    now = now_iso()
+    conn.execute(
+        "UPDATE review_schemes SET name = ?, updated_at = ? WHERE id = ?",
+        (new_name, now, scheme_id),
+    )
+    log_scheme_operation(conn, scheme_id, new_name, "rename",
+                         f"从 '{old_name}' 改名为 '{new_name}'")
+    return {"success": True, "old_name": old_name, "new_name": new_name}
+
+
+def delete_review_scheme(conn, scheme_id):
+    row = conn.execute(
+        "SELECT * FROM review_schemes WHERE id = ?", (scheme_id,)
+    ).fetchone()
+    if not row:
+        return {"success": False, "error": f"方案ID {scheme_id} 不存在"}
+
+    name = row["name"]
+    conn.execute(
+        "UPDATE review_scheme_operations SET scheme_id = NULL WHERE scheme_id = ?",
+        (scheme_id,),
+    )
+    conn.execute("DELETE FROM review_schemes WHERE id = ?", (scheme_id,))
+    log_scheme_operation(conn, None, name, "delete",
+                         f"删除方案 '{name}'")
+    return {"success": True, "name": name}
+
+
+def copy_review_scheme(conn, scheme_id, new_name, new_description=None):
+    existing = conn.execute(
+        "SELECT * FROM review_schemes WHERE id = ?", (scheme_id,)
+    ).fetchone()
+    if not existing:
+        return {"success": False, "error": f"方案ID {scheme_id} 不存在"}
+
+    name_exists = conn.execute(
+        "SELECT * FROM review_schemes WHERE name = ?", (new_name,)
+    ).fetchone()
+    if name_exists:
+        return {"success": False, "error": f"方案名 '{new_name}' 已存在", "needs_confirm": True}
+
+    old_name = existing["name"]
+    now = now_iso()
+    conn.execute(
+        """INSERT INTO review_schemes
+           (name, description, filter_state_json, data_date_range_json,
+            created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (new_name, new_description or existing["description"],
+         existing["filter_state_json"], existing["data_date_range_json"],
+         now, now),
+    )
+    row = conn.execute("SELECT * FROM review_schemes WHERE name = ?", (new_name,)).fetchone()
+    new_scheme_id = row["id"]
+    log_scheme_operation(conn, new_scheme_id, new_name, "copy",
+                         f"从方案 '{old_name}' 复制为 '{new_name}'")
+    return {"success": True, "new_scheme_id": new_scheme_id, "new_name": new_name}
+
+
+def mark_scheme_used(conn, scheme_id):
+    now = now_iso()
+    row = conn.execute(
+        "SELECT * FROM review_schemes WHERE id = ?", (scheme_id,)
+    ).fetchone()
+    if row:
+        conn.execute(
+            "UPDATE review_schemes SET last_used_at = ? WHERE id = ?",
+            (now, scheme_id),
+        )
+        save_ui_state(conn, "last_used_scheme_id", {"scheme_id": scheme_id, "used_at": now})
+        log_scheme_operation(conn, scheme_id, row["name"], "load",
+                             f"载入方案 '{row['name']}'")
+
+
+def get_last_used_scheme(conn):
+    last_id_state = load_ui_state(conn, "last_used_scheme_id")
+    if last_id_state and last_id_state.get("scheme_id"):
+        scheme = get_review_scheme_by_id(conn, last_id_state["scheme_id"])
+        if scheme:
+            return scheme
+    row = conn.execute(
+        "SELECT * FROM review_schemes ORDER BY last_used_at DESC NULLS LAST, updated_at DESC LIMIT 1"
+    ).fetchone()
+    if row:
+        return get_review_scheme_by_id(conn, row["id"])
+    return None
+
+
+def check_data_date_range_changed(conn, scheme_id):
+    scheme = get_review_scheme_by_id(conn, scheme_id)
+    if not scheme:
+        return {"changed": False}
+
+    saved_range = scheme.get("data_date_range")
+    current_range = get_date_range(conn)
+
+    if not saved_range or not current_range:
+        return {"changed": False, "saved": saved_range, "current": current_range}
+
+    changed = (saved_range.get("min_date") != current_range.get("min_date") or
+               saved_range.get("max_date") != current_range.get("max_date"))
+
+    return {
+        "changed": changed,
+        "saved": saved_range,
+        "current": current_range,
+    }
+
+
+def log_scheme_operation(conn, scheme_id, scheme_name, operation_type, operation_detail=None):
+    now = now_iso()
+    conn.execute(
+        """INSERT INTO review_scheme_operations
+           (scheme_id, scheme_name, operation_type, operation_detail, operated_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (scheme_id, scheme_name, operation_type, operation_detail, now),
+    )
+
+
+def get_scheme_operation_logs(conn, scheme_id=None, limit=100):
+    sql = "SELECT * FROM review_scheme_operations"
+    params = []
+    if scheme_id is not None:
+        sql += " WHERE scheme_id = ?"
+        params.append(scheme_id)
+    sql += " ORDER BY operated_at DESC LIMIT ?"
+    params.append(limit)
+    rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]

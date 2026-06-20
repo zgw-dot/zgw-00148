@@ -15,6 +15,10 @@ from db import (
     get_discrepancy_versions, get_all_rule_versions_with_labels,
     get_import_records_with_rule_version, save_ui_state, load_ui_state,
     get_store_list, get_barcode_list, get_date_range,
+    save_review_scheme, get_review_schemes, get_review_scheme_by_id,
+    get_review_scheme_by_name, update_review_scheme_name, delete_review_scheme,
+    copy_review_scheme, mark_scheme_used, get_last_used_scheme,
+    check_data_date_range_changed, get_scheme_operation_logs,
 )
 from import_service import import_csv
 from engine import run_attribution, CAUSE_LABELS
@@ -704,21 +708,290 @@ with tab6:
         barcodes = get_barcode_list(conn)
         rule_versions = get_all_rule_versions_with_labels(conn)
         date_range = get_date_range(conn)
+        all_schemes = get_review_schemes(conn)
+        last_used_scheme = get_last_used_scheme(conn)
+        operation_logs = get_scheme_operation_logs(conn, limit=50)
 
     saved_state = None
     with get_conn() as conn:
         saved_state = load_ui_state(conn, "review_filter_state")
 
-    if "review_filter_init" not in st.session_state and saved_state:
-        st.session_state.review_store = saved_state.get("store_id", "全部")
-        st.session_state.review_barcode = saved_state.get("barcode", "")
-        st.session_state.review_rule_ver_a = saved_state.get("rule_ver_a", 0)
-        st.session_state.review_rule_ver_b = saved_state.get("rule_ver_b", 0)
-        st.session_state.review_status = saved_state.get("status", "全部")
-        st.session_state.review_date_from = saved_state.get("date_from", "")
-        st.session_state.review_date_to = saved_state.get("date_to", "")
+    if "review_filter_init" not in st.session_state:
+        init_state = saved_state
+        if last_used_scheme and last_used_scheme.get("filter_state"):
+            init_state = last_used_scheme["filter_state"]
+            st.session_state.current_scheme_id = last_used_scheme["id"]
+            st.session_state.current_scheme_name = last_used_scheme["name"]
+        if init_state:
+            st.session_state.review_store = init_state.get("store_id", "全部")
+            st.session_state.review_barcode = init_state.get("barcode", "")
+            st.session_state.review_rule_ver_a = init_state.get("rule_ver_a", 0)
+            st.session_state.review_rule_ver_b = init_state.get("rule_ver_b", 0)
+            st.session_state.review_status = init_state.get("status", "全部")
+            st.session_state.review_date_from = init_state.get("date_from", "")
+            st.session_state.review_date_to = init_state.get("date_to", "")
         st.session_state.review_filter_init = True
 
+    st.subheader("📋 复盘方案管理")
+
+    scheme_col1, scheme_col2, scheme_col3 = st.columns([2, 2, 1])
+    with scheme_col1:
+        if all_schemes:
+            scheme_options = [(0, "--- 选择方案载入 ---")] + [
+                (s["id"], f"{s['name']} {'(最近使用)' if last_used_scheme and s['id'] == last_used_scheme.get('id') else ''}")
+                for s in all_schemes
+            ]
+            scheme_display = {k: v for k, v in scheme_options}
+            selected_scheme_id = st.selectbox(
+                "选择复盘方案",
+                list(scheme_display.keys()),
+                format_func=lambda x: scheme_display[x],
+                key="selected_scheme_id",
+            )
+            if selected_scheme_id > 0:
+                col_load, col_clear = st.columns(2)
+                with col_load:
+                    if st.button("📥 载入方案", type="primary", key="load_scheme_btn"):
+                        with get_conn() as conn:
+                            scheme = get_review_scheme_by_id(conn, selected_scheme_id)
+                        if scheme:
+                            fs = scheme["filter_state"]
+                            st.session_state.review_store = fs.get("store_id", "全部")
+                            st.session_state.review_barcode = fs.get("barcode", "")
+                            st.session_state.review_rule_ver_a = fs.get("rule_ver_a", 0)
+                            st.session_state.review_rule_ver_b = fs.get("rule_ver_b", 0)
+                            st.session_state.review_status = fs.get("status", "全部")
+                            st.session_state.review_date_from = fs.get("date_from", "")
+                            st.session_state.review_date_to = fs.get("date_to", "")
+                            st.session_state.current_scheme_id = scheme["id"]
+                            st.session_state.current_scheme_name = scheme["name"]
+                            with get_conn() as conn:
+                                mark_scheme_used(conn, scheme["id"])
+                                range_check = check_data_date_range_changed(conn, scheme["id"])
+                            if range_check.get("changed"):
+                                st.warning(
+                                    f"⚠️ 底层数据时间范围已变化！\n\n"
+                                    f"方案保存时: {range_check['saved'].get('min_date','')[:10]} ~ {range_check['saved'].get('max_date','')[:10]}\n"
+                                    f"当前数据: {range_check['current'].get('min_date','')[:10]} ~ {range_check['current'].get('max_date','')[:10]}"
+                                )
+                            st.success(f"✅ 已载入方案 '{scheme['name']}'")
+                            st.rerun()
+                with col_clear:
+                    if st.button("🔄 清除当前", key="clear_current_scheme"):
+                        for k in ["current_scheme_id", "current_scheme_name"]:
+                            if k in st.session_state:
+                                del st.session_state[k]
+                        st.rerun()
+        else:
+            st.info("暂无保存的方案，调整筛选条件后可保存为新方案")
+
+    with scheme_col2:
+        new_scheme_name = st.text_input(
+            "方案名称",
+            value=st.session_state.get("current_scheme_name", ""),
+            placeholder="输入方案名称以保存",
+            key="new_scheme_name",
+        )
+        new_scheme_desc = st.text_area(
+            "方案描述（可选）",
+            placeholder="简述这个方案的用途，如'618大促前后对比'",
+            key="new_scheme_desc",
+            height=60,
+        )
+        col_save, col_saveas = st.columns(2)
+        with col_save:
+            if st.button("💾 保存方案", key="save_scheme_btn"):
+                if not new_scheme_name.strip():
+                    st.error("请输入方案名称")
+                else:
+                    current_filters = {
+                        "store_id": st.session_state.get("review_store", "全部"),
+                        "barcode": st.session_state.get("review_barcode", ""),
+                        "rule_ver_a": st.session_state.get("review_rule_ver_a", 0),
+                        "rule_ver_b": st.session_state.get("review_rule_ver_b", 0),
+                        "status": st.session_state.get("review_status", "全部"),
+                        "date_from": st.session_state.get("review_date_from", ""),
+                        "date_to": st.session_state.get("review_date_to", ""),
+                        "saved_at": now_iso(),
+                    }
+                    confirm_key = f"save_confirm_{new_scheme_name.strip()}"
+                    if st.session_state.get(confirm_key):
+                        with get_conn() as conn:
+                            result = save_review_scheme(
+                                conn, new_scheme_name.strip(), current_filters,
+                                description=new_scheme_desc.strip() or None,
+                                overwrite=True,
+                                data_date_range=date_range,
+                            )
+                        if result["success"]:
+                            st.session_state.current_scheme_id = result["scheme_id"]
+                            st.session_state.current_scheme_name = result["name"]
+                            del st.session_state[confirm_key]
+                            action = "覆盖更新" if result["overwritten"] else "新建"
+                            st.success(f"✅ {action}方案成功: '{result['name']}'")
+                            st.rerun()
+                    else:
+                        with get_conn() as conn:
+                            result = save_review_scheme(
+                                conn, new_scheme_name.strip(), current_filters,
+                                description=new_scheme_desc.strip() or None,
+                                overwrite=False,
+                                data_date_range=date_range,
+                            )
+                        if result["success"]:
+                            st.session_state.current_scheme_id = result["scheme_id"]
+                            st.session_state.current_scheme_name = result["name"]
+                            st.success(f"✅ 新建方案成功: '{result['name']}'")
+                            st.rerun()
+                        elif result.get("needs_confirm"):
+                            st.warning(f"⚠️ 方案名 '{new_scheme_name.strip()}' 已存在，是否覆盖？")
+                            col_yes, col_no = st.columns(2)
+                            with col_yes:
+                                if st.button("✅ 确认覆盖", key=f"confirm_overwrite_{new_scheme_name.strip()}"):
+                                    st.session_state[confirm_key] = True
+                                    st.rerun()
+                            with col_no:
+                                if st.button("❌ 取消", key=f"cancel_overwrite_{new_scheme_name.strip()}"):
+                                    st.rerun()
+                        else:
+                            st.error(f"❌ {result.get('error', '保存失败')}")
+        with col_saveas:
+            if st.button("📋 另存为新", key="saveas_scheme_btn"):
+                if not new_scheme_name.strip():
+                    st.error("请输入新方案名称")
+                else:
+                    current_filters = {
+                        "store_id": st.session_state.get("review_store", "全部"),
+                        "barcode": st.session_state.get("review_barcode", ""),
+                        "rule_ver_a": st.session_state.get("review_rule_ver_a", 0),
+                        "rule_ver_b": st.session_state.get("review_rule_ver_b", 0),
+                        "status": st.session_state.get("review_status", "全部"),
+                        "date_from": st.session_state.get("review_date_from", ""),
+                        "date_to": st.session_state.get("review_date_to", ""),
+                        "saved_at": now_iso(),
+                    }
+                    with get_conn() as conn:
+                        result = save_review_scheme(
+                            conn, new_scheme_name.strip(), current_filters,
+                            description=new_scheme_desc.strip() or None,
+                            overwrite=False,
+                            data_date_range=date_range,
+                        )
+                    if result["success"]:
+                        st.session_state.current_scheme_id = result["scheme_id"]
+                        st.session_state.current_scheme_name = result["name"]
+                        st.success(f"✅ 另存为新方案成功: '{result['name']}'")
+                        st.rerun()
+                    elif result.get("needs_confirm"):
+                        st.error(f"❌ 方案名 '{new_scheme_name.strip()}' 已存在，请换一个名称")
+                    else:
+                        st.error(f"❌ {result.get('error', '保存失败')}")
+
+    with scheme_col3:
+        current_scheme_id = st.session_state.get("current_scheme_id")
+        current_scheme_name = st.session_state.get("current_scheme_name")
+        if current_scheme_id and current_scheme_name:
+            st.info(f"📌 当前方案:\n**{current_scheme_name}**")
+            col_rename, col_copy, col_del = st.columns(3)
+            with col_rename:
+                if st.button("✏️", key="rename_scheme_btn", help="改名"):
+                    st.session_state.show_rename_dialog = True
+            with col_copy:
+                if st.button("📋", key="copy_scheme_btn", help="复制后改"):
+                    st.session_state.show_copy_dialog = True
+            with col_del:
+                if st.button("🗑️", key="delete_scheme_btn", help="删除"):
+                    st.session_state.show_delete_dialog = True
+
+            if st.session_state.get("show_rename_dialog"):
+                rename_new_name = st.text_input("新名称", value=current_scheme_name, key="rename_new_name")
+                col_confirm, col_cancel = st.columns(2)
+                with col_confirm:
+                    if st.button("✅ 确认改名", key="confirm_rename"):
+                        if rename_new_name.strip() and rename_new_name.strip() != current_scheme_name:
+                            with get_conn() as conn:
+                                result = update_review_scheme_name(conn, current_scheme_id, rename_new_name.strip())
+                            if result["success"]:
+                                st.session_state.current_scheme_name = result["new_name"]
+                                st.session_state.new_scheme_name = result["new_name"]
+                                del st.session_state.show_rename_dialog
+                                st.success(f"✅ 已改名为: '{result['new_name']}'")
+                                st.rerun()
+                            else:
+                                st.error(f"❌ {result.get('error', '改名失败')}")
+                        else:
+                            st.error("请输入不同的新名称")
+                with col_cancel:
+                    if st.button("❌ 取消", key="cancel_rename"):
+                        del st.session_state.show_rename_dialog
+                        st.rerun()
+
+            if st.session_state.get("show_copy_dialog"):
+                copy_new_name = st.text_input("新方案名称", value=f"{current_scheme_name} 副本", key="copy_new_name")
+                copy_new_desc = st.text_area("描述（可选）", key="copy_new_desc", height=50)
+                col_confirm, col_cancel = st.columns(2)
+                with col_confirm:
+                    if st.button("✅ 确认复制", key="confirm_copy"):
+                        if copy_new_name.strip():
+                            with get_conn() as conn:
+                                result = copy_review_scheme(
+                                    conn, current_scheme_id, copy_new_name.strip(),
+                                    new_description=copy_new_desc.strip() or None,
+                                )
+                            if result["success"]:
+                                st.session_state.current_scheme_id = result["new_scheme_id"]
+                                st.session_state.current_scheme_name = result["new_name"]
+                                st.session_state.new_scheme_name = result["new_name"]
+                                del st.session_state.show_copy_dialog
+                                st.success(f"✅ 已复制为: '{result['new_name']}'")
+                                st.rerun()
+                            elif result.get("needs_confirm"):
+                                st.error(f"❌ 名称 '{copy_new_name.strip()}' 已存在")
+                            else:
+                                st.error(f"❌ {result.get('error', '复制失败')}")
+                        else:
+                            st.error("请输入新方案名称")
+                with col_cancel:
+                    if st.button("❌ 取消", key="cancel_copy"):
+                        del st.session_state.show_copy_dialog
+                        st.rerun()
+
+            if st.session_state.get("show_delete_dialog"):
+                st.warning(f"⚠️ 确定要删除方案 '{current_scheme_name}' 吗？")
+                col_confirm, col_cancel = st.columns(2)
+                with col_confirm:
+                    if st.button("✅ 确认删除", type="primary", key="confirm_delete"):
+                        with get_conn() as conn:
+                            result = delete_review_scheme(conn, current_scheme_id)
+                        if result["success"]:
+                            for k in ["current_scheme_id", "current_scheme_name", "show_delete_dialog"]:
+                                if k in st.session_state:
+                                    del st.session_state[k]
+                            st.success(f"✅ 已删除方案: '{result['name']}'")
+                            st.rerun()
+                        else:
+                            st.error(f"❌ {result.get('error', '删除失败')}")
+                with col_cancel:
+                    if st.button("❌ 取消", key="cancel_delete"):
+                        del st.session_state.show_delete_dialog
+                        st.rerun()
+
+    with st.expander("📜 操作日志（最近50条）", expanded=False):
+        if operation_logs:
+            log_df = pd.DataFrame(operation_logs)
+            log_df = log_df[["operated_at", "scheme_name", "operation_type", "operation_detail", "operator"]]
+            log_df.columns = ["操作时间", "方案名称", "操作类型", "操作详情", "操作人"]
+            log_df["操作时间"] = log_df["操作时间"].str[:19]
+            type_labels = {
+                "create": "新建", "update": "更新", "rename": "改名",
+                "copy": "复制", "delete": "删除", "load": "载入",
+            }
+            log_df["操作类型"] = log_df["操作类型"].map(type_labels).fillna(log_df["操作类型"])
+            st.dataframe(log_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("暂无操作日志")
+
+    st.divider()
     st.subheader("🔍 筛选条件")
 
     col_f1, col_f2 = st.columns(2)
@@ -1121,15 +1394,39 @@ with tab6:
 
             all_export_data.append(row)
 
+        current_scheme_id = st.session_state.get("current_scheme_id")
+        current_scheme_name = st.session_state.get("current_scheme_name", "")
+
+        rule_a_label = f"v{filter_rule_a}" if filter_rule_a else "全部"
+        rule_b_label = f"v{filter_rule_b}" if filter_rule_b else "全部"
+        if rule_versions:
+            rv_map = {v["version"]: v for v in rule_versions}
+            if filter_rule_a and filter_rule_a in rv_map:
+                rv_a = rv_map[filter_rule_a]
+                cfg_a = json.loads(rv_a["config_json"]) if rv_a.get("config_json") else {}
+                rule_a_label += f" (损耗阈值{cfg_a.get('loss_threshold_pct', '-')}%)"
+            if filter_rule_b and filter_rule_b in rv_map:
+                rv_b = rv_map[filter_rule_b]
+                cfg_b = json.loads(rv_b["config_json"]) if rv_b.get("config_json") else {}
+                rule_b_label += f" (损耗阈值{cfg_b.get('loss_threshold_pct', '-')}%)"
+
         filter_summary = {
             "exported_at": now_iso(),
+            "scheme_name": current_scheme_name or "",
+            "scheme_id": current_scheme_id or "",
             "filter_store": filter_store,
             "filter_barcode": filter_barcode,
             "filter_status": filter_status,
             "filter_rule_a": filter_rule_a,
             "filter_rule_b": filter_rule_b,
+            "filter_rule_a_label": rule_a_label,
+            "filter_rule_b_label": rule_b_label,
             "filter_date_from": date_from_param or "",
             "filter_date_to": date_to_param or "",
+            "version_summary": {
+                "rule_a": rule_a_label,
+                "rule_b": rule_b_label,
+            },
             "summary": {
                 "total_items": len(all_keys),
                 "count_version_a": len(discs_a),
@@ -1145,18 +1442,27 @@ with tab6:
             filter_summary["summary"]["diff_qty_changed"] = diff_qty_count
             filter_summary["summary"]["cause_changed"] = cause_change_count
 
+        if current_scheme_id and current_scheme_name:
+            with get_conn() as conn:
+                log_scheme_operation(
+                    conn, current_scheme_id, current_scheme_name, "export",
+                    f"导出对比结果，共{len(all_keys)}条商品，格式:{export_format_rv}"
+                )
+
         if all_export_data:
             if export_format_rv == "CSV":
                 df_rv = pd.DataFrame(all_export_data)
-                df_rv.insert(0, "filter_store", filter_store)
-                df_rv.insert(1, "filter_barcode", filter_barcode)
-                df_rv.insert(2, "filter_rule_a", f"v{filter_rule_a}" if filter_rule_a else "全部")
-                df_rv.insert(3, "filter_rule_b", f"v{filter_rule_b}" if filter_rule_b else "全部")
-                df_rv.insert(4, "filter_status", filter_status)
-                df_rv.insert(5, "filter_date_from", date_from_param or "不限")
-                df_rv.insert(6, "filter_date_to", date_to_param or "不限")
+                df_rv.insert(0, "scheme_name", current_scheme_name or "")
+                df_rv.insert(1, "filter_store", filter_store)
+                df_rv.insert(2, "filter_barcode", filter_barcode)
+                df_rv.insert(3, "filter_rule_a", rule_a_label)
+                df_rv.insert(4, "filter_rule_b", rule_b_label)
+                df_rv.insert(5, "filter_status", filter_status)
+                df_rv.insert(6, "filter_date_from", date_from_param or "不限")
+                df_rv.insert(7, "filter_date_to", date_to_param or "不限")
 
                 col_map = {
+                    "scheme_name": "方案名称",
                     "filter_store": "筛选-门店",
                     "filter_barcode": "筛选-商品",
                     "filter_rule_a": "筛选-规则版本A",
@@ -1198,23 +1504,27 @@ with tab6:
 
                 date_from_display = filter_summary.get("filter_date_from") or "不限"
                 date_to_display = filter_summary.get("filter_date_to") or "不限"
+                scheme_display = current_scheme_name or "(未命名方案)"
                 summary_lines = [
                     "# 差异复盘对比导出",
+                    f"# 方案名称: {scheme_display}",
                     f"# 导出时间: {filter_summary['exported_at']}",
+                    f"# 时间条件: {date_from_display} ~ {date_to_display}",
+                    f"# 版本摘要: 版本A={rule_a_label}, 版本B={rule_b_label}",
                     f"# 筛选条件: 门店={filter_summary['filter_store']}, 商品={filter_summary['filter_barcode']}, "
-                    f"时间范围={date_from_display}~{date_to_display}, "
-                    f"规则A=v{filter_summary['filter_rule_a'] if filter_summary['filter_rule_a'] else '全部'}, "
-                    f"规则B=v{filter_summary['filter_rule_b'] if filter_summary['filter_rule_b'] else '全部'}, "
                     f"状态={filter_summary['filter_status']}",
                     f"# 对比摘要: {json.dumps(filter_summary['summary'], ensure_ascii=False)}",
                     "#",
                 ]
                 full_csv = "\n".join(summary_lines) + csv_content
 
+                csv_file_name = f"discrepancy_compare_{current_scheme_name or 'unnamed'}_{now_iso()[:10]}.csv"
+                csv_file_name = csv_file_name.replace(" ", "_").replace("/", "_")
+
                 st.download_button(
-                    "⬇️ 下载 CSV（含筛选条件+对比摘要+并排版本）",
+                    "⬇️ 下载 CSV（含方案名+时间条件+版本摘要+对比数据）",
                     data=full_csv.encode("utf-8-sig"),
-                    file_name=f"discrepancy_compare_{now_iso()[:10]}.csv",
+                    file_name=csv_file_name,
                     mime="text/csv",
                 )
 
@@ -1222,6 +1532,18 @@ with tab6:
             else:
                 json_export = {
                     "export_metadata": filter_summary,
+                    "scheme_info": {
+                        "scheme_id": current_scheme_id or "",
+                        "scheme_name": current_scheme_name or "",
+                        "time_condition": {
+                            "date_from": date_from_param or "不限",
+                            "date_to": date_to_param or "不限",
+                        },
+                        "version_summary": {
+                            "rule_a": rule_a_label,
+                            "rule_b": rule_b_label,
+                        },
+                    },
                     "comparison_data": all_export_data,
                     "rule_versions_info": [
                         {"version": v["version"], "config": json.loads(v["config_json"]), "created_at": v["created_at"]}
@@ -1229,10 +1551,14 @@ with tab6:
                     ],
                 }
                 json_str = json.dumps(json_export, ensure_ascii=False, indent=2, default=str)
+
+                json_file_name = f"discrepancy_compare_{current_scheme_name or 'unnamed'}_{now_iso()[:10]}.json"
+                json_file_name = json_file_name.replace(" ", "_").replace("/", "_")
+
                 st.download_button(
-                    "⬇️ 下载 JSON（含筛选条件+对比摘要+规则版本+完整数据）",
+                    "⬇️ 下载 JSON（含方案名+时间条件+版本摘要+完整数据）",
                     data=json_str.encode("utf-8"),
-                    file_name=f"discrepancy_compare_{now_iso()[:10]}.json",
+                    file_name=json_file_name,
                     mime="application/json",
                 )
                 with st.expander("📋 预览导出内容（含筛选条件和对比摘要）", expanded=False):

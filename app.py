@@ -1146,24 +1146,24 @@ with tab6:
             filter_summary["summary"]["cause_changed"] = cause_change_count
 
         if all_export_data:
-                if export_format_rv == "CSV":
-                    df_rv = pd.DataFrame(all_export_data)
-                    df_rv.insert(0, "filter_store", filter_store)
-                    df_rv.insert(1, "filter_barcode", filter_barcode)
-                    df_rv.insert(2, "filter_rule_a", f"v{filter_rule_a}" if filter_rule_a else "全部")
-                    df_rv.insert(3, "filter_rule_b", f"v{filter_rule_b}" if filter_rule_b else "全部")
-                    df_rv.insert(4, "filter_status", filter_status)
-                    df_rv.insert(5, "filter_date_from", date_from_param or "不限")
-                    df_rv.insert(6, "filter_date_to", date_to_param or "不限")
+            if export_format_rv == "CSV":
+                df_rv = pd.DataFrame(all_export_data)
+                df_rv.insert(0, "filter_store", filter_store)
+                df_rv.insert(1, "filter_barcode", filter_barcode)
+                df_rv.insert(2, "filter_rule_a", f"v{filter_rule_a}" if filter_rule_a else "全部")
+                df_rv.insert(3, "filter_rule_b", f"v{filter_rule_b}" if filter_rule_b else "全部")
+                df_rv.insert(4, "filter_status", filter_status)
+                df_rv.insert(5, "filter_date_from", date_from_param or "不限")
+                df_rv.insert(6, "filter_date_to", date_to_param or "不限")
 
-                    col_map = {
-                        "filter_store": "筛选-门店",
-                        "filter_barcode": "筛选-商品",
-                        "filter_rule_a": "筛选-规则版本A",
-                        "filter_rule_b": "筛选-规则版本B",
-                        "filter_status": "筛选-状态",
-                        "filter_date_from": "筛选-开始时间",
-                        "filter_date_to": "筛选-结束时间",
+                col_map = {
+                    "filter_store": "筛选-门店",
+                    "filter_barcode": "筛选-商品",
+                    "filter_rule_a": "筛选-规则版本A",
+                    "filter_rule_b": "筛选-规则版本B",
+                    "filter_status": "筛选-状态",
+                    "filter_date_from": "筛选-开始时间",
+                    "filter_date_to": "筛选-结束时间",
                     "store_id": "门店",
                     "barcode": "条码",
                     "sku_name": "商品名称",

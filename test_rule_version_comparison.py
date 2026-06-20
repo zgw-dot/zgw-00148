@@ -25,6 +25,9 @@ DB_PATH = os.path.join(BASE_DIR, "inventory_diff_test.db")
 from test_utils import init_test_env
 init_test_env(DB_PATH)
 
+import db as db_mod
+db_mod.DB_PATH = DB_PATH
+
 from db import (
     init_db, get_conn, get_discrepancies, get_evidence_for_discrepancy,
     get_status_log, get_stores, get_import_records,
@@ -38,12 +41,29 @@ from db import (
     now_iso,
 )
 from import_service import import_csv, validate_row, compute_file_hash, REQUIRED_FIELDS, NUMERIC_FIELDS
+import import_service
+import_service.db_mod = db_mod
+
+import engine
+engine.db_mod = db_mod
+
+import rules
+rules.db_mod = db_mod
+
 from engine import run_attribution, CAUSE_LABELS
 from rules import save_rule_config, get_current_config, get_version_history
 from sample_data import generate_sample_data, SAMPLE_DIR
 
 if os.path.exists(DB_PATH):
     os.remove(DB_PATH)
+for suffix in ("-wal", "-shm"):
+    p = DB_PATH + suffix
+    if os.path.exists(p):
+        os.remove(p)
+
+MAIN_DB_PATH = os.path.join(BASE_DIR, "inventory_diff.db")
+assert "test" in DB_PATH, f"测试使用独立数据库: {DB_PATH}"
+assert DB_PATH != MAIN_DB_PATH, f"测试数据库不应与主数据库相同: {DB_PATH} vs {MAIN_DB_PATH}"
 
 init_db()
 generate_sample_data()
@@ -434,8 +454,8 @@ print("=" * 70)
 
 import importlib
 import db as db_mod
-import importlib as importlib_mod
-importlib_mod.reload(db_mod)
+importlib.reload(db_mod)
+db_mod.DB_PATH = DB_PATH
 
 with db_mod.get_conn() as conn:
     discs_after = db_mod.get_discrepancies(conn)
@@ -646,6 +666,7 @@ print("=" * 70)
 
 import importlib
 importlib.reload(db_mod)
+db_mod.DB_PATH = DB_PATH
 with db_mod.get_conn() as conn:
     state_after = db_mod.load_ui_state(conn, "review_filter_state")
     discs_after_v1_all = db_mod.get_discrepancies_extended(conn, rule_version=1, date_from=state_after.get("date_from"), date_to=state_after.get("date_to"))

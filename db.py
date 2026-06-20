@@ -15,7 +15,15 @@ CREATE TABLE IF NOT EXISTS import_records (
     imported_at TEXT NOT NULL,
     row_count INTEGER,
     error_count INTEGER,
-    UNIQUE(file_hash, import_type)
+    rule_version_id INTEGER,
+    FOREIGN KEY (rule_version_id) REFERENCES rule_versions(id)
+);
+
+CREATE TABLE IF NOT EXISTS ui_state (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    state_key TEXT NOT NULL UNIQUE,
+    state_value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS raw_data (
@@ -170,6 +178,69 @@ def get_conn():
 def init_db():
     with get_conn() as conn:
         conn.executescript(SCHEMA_SQL)
+        _migrate_db(conn)
+
+
+def _migrate_db(conn):
+    cols = conn.execute("PRAGMA table_info(import_records)").fetchall()
+    col_names = [c["name"] for c in cols]
+
+    has_rule_ver = "rule_version_id" in col_names
+
+    existing_unique = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='import_records'"
+    ).fetchone()
+    table_sql = existing_unique["sql"] if existing_unique else ""
+    has_old_unique = "UNIQUE" in table_sql.upper() and "rule_version_id" not in table_sql
+
+    if not has_rule_ver or has_old_unique:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS import_records_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_hash TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                import_type TEXT NOT NULL,
+                imported_at TEXT NOT NULL,
+                row_count INTEGER,
+                error_count INTEGER,
+                rule_version_id INTEGER,
+                FOREIGN KEY (rule_version_id) REFERENCES rule_versions(id)
+            )
+        """)
+
+        old_cols = ", ".join([c["name"] for c in cols])
+        new_cols = old_cols + (", rule_version_id" if not has_rule_ver else "")
+        if has_rule_ver:
+            conn.execute(f"""
+                INSERT INTO import_records_new ({old_cols})
+                SELECT {old_cols} FROM import_records
+            """)
+        else:
+            conn.execute(f"""
+                INSERT INTO import_records_new ({old_cols}, rule_version_id)
+                SELECT {old_cols}, NULL FROM import_records
+            """)
+
+        conn.execute("DROP TABLE import_records")
+        conn.execute("ALTER TABLE import_records_new RENAME TO import_records")
+
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_import_unique_hash_type_rule "
+        "ON import_records(file_hash, import_type, rule_version_id)"
+    )
+
+    ui_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='ui_state'"
+    ).fetchone()
+    if not ui_exists:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ui_state (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                state_key TEXT NOT NULL UNIQUE,
+                state_value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
 
 
 def now_iso():
@@ -317,11 +388,14 @@ def clear_all_discrepancies(conn):
     conn.execute("DELETE FROM discrepancies")
 
 
-def get_discrepancy_by_business_key(conn, store_id, barcode):
-    row = conn.execute(
-        "SELECT * FROM discrepancies WHERE store_id = ? AND barcode = ? LIMIT 1",
-        (store_id, barcode),
-    ).fetchone()
+def get_discrepancy_by_business_key(conn, store_id, barcode, rule_version_id=None):
+    sql = "SELECT * FROM discrepancies WHERE store_id = ? AND barcode = ?"
+    params = [store_id, barcode]
+    if rule_version_id is not None:
+        sql += " AND rule_version_id = ?"
+        params.append(rule_version_id)
+    sql += " LIMIT 1"
+    row = conn.execute(sql, params).fetchone()
     if row:
         return dict(row)
     return None
@@ -417,3 +491,138 @@ DEFAULT_RULES = {
 
 def resolve_barcode(barcode, aliases):
     return aliases.get(barcode, barcode)
+
+
+def get_discrepancies_extended(conn, store_id=None, status=None, rule_version=None,
+                               barcode=None, date_from=None, date_to=None):
+    sql = "SELECT d.*, rv.version as rule_ver, rv.config_json as rule_config FROM discrepancies d LEFT JOIN rule_versions rv ON d.rule_version_id = rv.id WHERE 1=1"
+    params = []
+    if store_id:
+        sql += " AND d.store_id = ?"
+        params.append(store_id)
+    if status:
+        sql += " AND d.status = ?"
+        params.append(status)
+    if rule_version:
+        sql += " AND rv.version = ?"
+        params.append(rule_version)
+    if barcode:
+        sql += " AND (d.barcode LIKE ? OR d.sku_name LIKE ?)"
+        params.extend([f"%{barcode}%", f"%{barcode}%"])
+    if date_from:
+        sql += " AND d.created_at >= ?"
+        params.append(date_from)
+    if date_to:
+        sql += " AND d.created_at <= ?"
+        params.append(date_to)
+    sql += " ORDER BY d.store_id, d.barcode, rv.version DESC, d.created_at DESC"
+    rows = conn.execute(sql, params).fetchall()
+    results = [dict(r) for r in rows]
+    for r in results:
+        if r.get("rule_config"):
+            try:
+                r["rule_config"] = json.loads(r["rule_config"])
+            except (TypeError, json.JSONDecodeError):
+                pass
+    return results
+
+
+def get_discrepancy_versions(conn, store_id, barcode):
+    sql = """SELECT d.*, rv.version as rule_ver, rv.config_json as rule_config,
+                    rv.created_at as rule_created_at
+             FROM discrepancies d
+             LEFT JOIN rule_versions rv ON d.rule_version_id = rv.id
+             WHERE d.store_id = ? AND d.barcode = ?
+             ORDER BY rv.version DESC, d.created_at DESC"""
+    rows = conn.execute(sql, (store_id, barcode)).fetchall()
+    results = [dict(r) for r in rows]
+    for r in results:
+        if r.get("rule_config"):
+            try:
+                r["rule_config"] = json.loads(r["rule_config"])
+            except (TypeError, json.JSONDecodeError):
+                pass
+        if r.get("snapshot"):
+            try:
+                r["snapshot"] = json.loads(r["snapshot"])
+            except (TypeError, json.JSONDecodeError):
+                pass
+    return results
+
+
+def get_all_rule_versions_with_labels(conn):
+    rows = conn.execute(
+        "SELECT *, (SELECT COUNT(*) FROM discrepancies d WHERE d.rule_version_id = rv.id) as disc_count "
+        "FROM rule_versions rv ORDER BY version DESC"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_import_records_with_rule_version(conn):
+    rows = conn.execute(
+        """SELECT ir.*, rv.version as rule_ver
+           FROM import_records ir
+           LEFT JOIN rule_versions rv ON ir.rule_version_id = rv.id
+           ORDER BY ir.imported_at DESC"""
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def check_import_duplicate(conn, file_hash, import_type, rule_version_id=None):
+    sql = "SELECT * FROM import_records WHERE file_hash = ? AND import_type = ?"
+    params = [file_hash, import_type]
+    if rule_version_id is not None:
+        sql += " AND rule_version_id = ?"
+        params.append(rule_version_id)
+    rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def save_ui_state(conn, state_key, state_value):
+    now = now_iso()
+    conn.execute(
+        """INSERT INTO ui_state (state_key, state_value, updated_at)
+           VALUES (?, ?, ?)
+           ON CONFLICT(state_key) DO UPDATE SET
+               state_value = excluded.state_value,
+               updated_at = excluded.updated_at""",
+        (state_key, json.dumps(state_value, ensure_ascii=False), now),
+    )
+
+
+def load_ui_state(conn, state_key, default=None):
+    row = conn.execute(
+        "SELECT state_value FROM ui_state WHERE state_key = ?",
+        (state_key,)
+    ).fetchone()
+    if row:
+        try:
+            return json.loads(row["state_value"])
+        except (TypeError, json.JSONDecodeError):
+            return default
+    return default
+
+
+def get_store_list(conn):
+    rows = conn.execute(
+        "SELECT DISTINCT store_id FROM raw_data ORDER BY store_id"
+    ).fetchall()
+    return [r["store_id"] for r in rows if r["store_id"]]
+
+
+def get_barcode_list(conn, store_id=None):
+    sql = "SELECT DISTINCT barcode, sku_name FROM raw_data WHERE 1=1"
+    params = []
+    if store_id:
+        sql += " AND store_id = ?"
+        params.append(store_id)
+    sql += " ORDER BY barcode"
+    rows = conn.execute(sql, params).fetchall()
+    return [{"barcode": r["barcode"], "sku_name": r["sku_name"] or r["barcode"]} for r in rows if r["barcode"]]
+
+
+def get_date_range(conn):
+    row = conn.execute(
+        "SELECT MIN(imported_at) as min_date, MAX(imported_at) as max_date FROM import_records"
+    ).fetchone()
+    return dict(row) if row else None

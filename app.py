@@ -11,7 +11,10 @@ from db import (
     get_discrepancies, get_evidence_for_discrepancy, get_status_log,
     get_stores, get_import_records, transition_status, update_review_note,
     get_active_rule_version, now_iso, get_snapshot_for_discrepancy,
-    get_calc_steps_for_discrepancy,
+    get_calc_steps_for_discrepancy, get_discrepancies_extended,
+    get_discrepancy_versions, get_all_rule_versions_with_labels,
+    get_import_records_with_rule_version, save_ui_state, load_ui_state,
+    get_store_list, get_barcode_list, get_date_range,
 )
 from import_service import import_csv
 from engine import run_attribution, CAUSE_LABELS
@@ -41,8 +44,8 @@ def _status_badge(status):
 
 st.title("📦 门店盘点差异复盘工具")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "📥 数据导入", "🔍 差异归因", "📋 差异列表", "⚙️ 规则配置", "📤 导出",
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "📥 数据导入", "🔍 差异归因", "📋 差异列表", "⚙️ 规则配置", "📤 导出", "📊 差异复盘对比",
 ])
 
 # ── Tab 1: 数据导入 ──
@@ -58,16 +61,36 @@ with tab1:
 
         if uploaded:
             content = uploaded.read()
-            result = import_csv(import_type, uploaded.name, content)
+            dup_key = f"dup_confirm_{import_type}_{uploaded.name}"
+
+            if st.session_state.get(dup_key):
+                result = import_csv(import_type, uploaded.name, content, allow_different_rule_version=True)
+                del st.session_state[dup_key]
+            else:
+                result = import_csv(import_type, uploaded.name, content)
+
             if result["success"]:
-                st.success(f"✅ 导入成功！有效行: {result['valid_rows']}，总行: {result['total_rows']}")
+                rv = result.get("rule_version", "-")
+                st.success(f"✅ 导入成功！规则 v{rv}，有效行: {result['valid_rows']}，总行: {result['total_rows']}")
                 if result.get("error_rows"):
                     st.warning(f"⚠️ 有 {result['error_rows']} 行被跳过：")
                     for e in result.get("detail_errors", []):
                         st.error(e)
             else:
                 if result.get("duplicate"):
-                    st.warning(f"⚠️ {result['error']}")
+                    dup_type = result.get("duplicate_type")
+                    if dup_type == "different_rule_version":
+                        st.warning(result["error"])
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            if st.button("✅ 确认继续导入（分开存储）", key=f"confirm_{dup_key}"):
+                                st.session_state[dup_key] = True
+                                st.rerun()
+                        with col2:
+                            if st.button("❌ 取消", key=f"cancel_{dup_key}"):
+                                st.rerun()
+                    else:
+                        st.warning(f"⚠️ {result['error']}")
                 else:
                     st.error(f"❌ {result['error']}")
                     for e in result.get("detail_errors", []):
@@ -88,17 +111,58 @@ with tab1:
                 with open(fpath, "rb") as f:
                     content = f.read()
                 btn_key = f"sample_{itype}"
-                if st.button(f"📁 导入样例{label}", key=btn_key):
-                    result = import_csv(itype, fname, content)
+                dup_key = f"sample_dup_confirm_{itype}"
+
+                if st.session_state.get(dup_key):
+                    result = import_csv(itype, fname, content, allow_different_rule_version=True)
+                    del st.session_state[dup_key]
                     if result["success"]:
-                        st.success(f"✅ 样例{label}导入成功！有效行: {result['valid_rows']}")
+                        rv = result.get("rule_version", "-")
+                        st.success(f"✅ 样例{label}导入成功！规则 v{rv}，有效行: {result['valid_rows']}")
                         if result.get("error_rows"):
                             st.warning(f"⚠️ {result['error_rows']} 行被跳过")
                     else:
                         if result.get("duplicate"):
-                            st.warning(f"⚠️ {result['error']}")
+                            dup_type = result.get("duplicate_type")
+                            if dup_type == "different_rule_version":
+                                st.warning(result["error"])
+                                col1, col2 = st.columns(2)
+                                with col1:
+                                    if st.button("✅ 确认继续导入", key=f"sample_confirm_{dup_key}"):
+                                        st.session_state[dup_key] = True
+                                        st.rerun()
+                                with col2:
+                                    if st.button("❌ 取消", key=f"sample_cancel_{dup_key}"):
+                                        st.rerun()
+                            else:
+                                st.warning(f"⚠️ {result['error']}")
                         else:
                             st.error(f"❌ {result['error']}")
+                else:
+                    if st.button(f"📁 导入样例{label}", key=btn_key):
+                        result = import_csv(itype, fname, content)
+                        if result["success"]:
+                            rv = result.get("rule_version", "-")
+                            st.success(f"✅ 样例{label}导入成功！规则 v{rv}，有效行: {result['valid_rows']}")
+                            if result.get("error_rows"):
+                                st.warning(f"⚠️ {result['error_rows']} 行被跳过")
+                        else:
+                            if result.get("duplicate"):
+                                dup_type = result.get("duplicate_type")
+                                if dup_type == "different_rule_version":
+                                    st.warning(result["error"])
+                                    col1, col2 = st.columns(2)
+                                    with col1:
+                                        if st.button("✅ 确认继续导入", key=f"sample_confirm_{dup_key}"):
+                                            st.session_state[dup_key] = True
+                                            st.rerun()
+                                    with col2:
+                                        if st.button("❌ 取消", key=f"sample_cancel_{dup_key}"):
+                                            st.rerun()
+                                else:
+                                    st.warning(f"⚠️ {result['error']}")
+                            else:
+                                st.error(f"❌ {result['error']}")
 
         st.divider()
         st.subheader("测试坏行导入")
@@ -134,13 +198,15 @@ with tab1:
     st.divider()
     st.subheader("导入记录")
     with get_conn() as conn:
-        records = get_import_records(conn)
+        records = get_import_records_with_rule_version(conn)
     if records:
         df_import = pd.DataFrame(records)
         df_import["import_type"] = df_import["import_type"].map(
             {"inventory": "库存", "sales": "销售", "transfer": "调拨", "stocktake": "盘点"}
         )
-        df_import = df_import[["file_name", "import_type", "imported_at", "row_count", "error_count"]]
+        df_import["rule_ver"] = df_import["rule_ver"].apply(lambda x: f"v{x}" if x else "-")
+        df_import = df_import[["file_name", "import_type", "rule_ver", "imported_at", "row_count", "error_count"]]
+        df_import.columns = ["文件名", "类型", "规则版本", "导入时间", "有效行", "错误行"]
         st.dataframe(df_import, use_container_width=True, hide_index=True)
     else:
         st.info("暂无导入记录")
@@ -626,3 +692,518 @@ with tab5:
             )
     else:
         st.info("暂无差异数据可导出")
+
+
+# ── Tab 6: 差异复盘对比 ──
+with tab6:
+    st.header("📊 差异复盘对比（按规则版本回看）")
+    st.markdown("按**门店、时间、商品、规则版本**筛选，将旧记录、新记录、别名变化和归因快照并排对比，无需来回翻导出文件。")
+
+    with get_conn() as conn:
+        stores = get_store_list(conn)
+        barcodes = get_barcode_list(conn)
+        rule_versions = get_all_rule_versions_with_labels(conn)
+        date_range = get_date_range(conn)
+
+    saved_state = None
+    with get_conn() as conn:
+        saved_state = load_ui_state(conn, "review_filter_state")
+
+    if "review_filter_init" not in st.session_state and saved_state:
+        st.session_state.review_store = saved_state.get("store_id", "全部")
+        st.session_state.review_barcode = saved_state.get("barcode", "")
+        st.session_state.review_rule_ver_a = saved_state.get("rule_ver_a", 0)
+        st.session_state.review_rule_ver_b = saved_state.get("rule_ver_b", 0)
+        st.session_state.review_status = saved_state.get("status", "全部")
+        st.session_state.review_filter_init = True
+
+    st.subheader("🔍 筛选条件")
+
+    col_f1, col_f2 = st.columns(2)
+    with col_f1:
+        filter_store = st.selectbox(
+            "按门店筛选",
+            ["全部"] + stores,
+            key="review_store",
+        )
+        filter_barcode = st.text_input(
+            "按商品条码/名称搜索",
+            value=st.session_state.get("review_barcode", ""),
+            key="review_barcode",
+            placeholder="输入条码或商品名称关键词",
+        )
+        filter_status = st.selectbox(
+            "按状态筛选",
+            ["全部"] + list(STATUS_LABELS.keys()),
+            format_func=lambda x: "全部" if x == "全部" else STATUS_LABELS.get(x, x),
+            key="review_status",
+        )
+
+    with col_f2:
+        rv_options = [(0, "全部规则版本")] + [(v["version"], f'v{v["version"]} ({v["disc_count"]}条差异)') for v in rule_versions]
+        rv_display_a = {k: v for k, v in rv_options}
+        rv_display_b = {k: v for k, v in rv_options}
+        filter_rule_a = st.selectbox(
+            "对比版本 A（旧规则）",
+            list(rv_display_a.keys()),
+            format_func=lambda x: rv_display_a[x],
+            key="review_rule_ver_a",
+        )
+        filter_rule_b = st.selectbox(
+            "对比版本 B（新规则）",
+            list(rv_display_b.keys()),
+            format_func=lambda x: rv_display_b[x],
+            key="review_rule_ver_b",
+        )
+
+    col_btn1, col_btn2, _ = st.columns([1, 1, 3])
+    with col_btn1:
+        if st.button("💾 记住当前筛选", type="secondary", key="save_filter"):
+            state_to_save = {
+                "store_id": filter_store,
+                "barcode": filter_barcode,
+                "rule_ver_a": filter_rule_a,
+                "rule_ver_b": filter_rule_b,
+                "status": filter_status,
+                "saved_at": now_iso(),
+            }
+            with get_conn() as conn:
+                save_ui_state(conn, "review_filter_state", state_to_save)
+            st.success("✅ 筛选条件已保存，重启后可自动恢复")
+    with col_btn2:
+        if st.button("🔄 重置筛选", key="reset_filter"):
+            if "review_filter_init" in st.session_state:
+                del st.session_state.review_filter_init
+            for k in ["review_store", "review_barcode", "review_rule_ver_a", "review_rule_ver_b", "review_status"]:
+                if k in st.session_state:
+                    del st.session_state[k]
+            with get_conn() as conn:
+                save_ui_state(conn, "review_filter_state", None)
+            st.rerun()
+
+    if saved_state:
+        st.info(f"💡 已恢复上次筛选组合（保存于 {saved_state.get('saved_at', '')[:19]}）")
+
+    st.divider()
+
+    store_param = None if filter_store == "全部" else filter_store
+    status_param = None if filter_status == "全部" else filter_status
+    rule_param_a = None if filter_rule_a == 0 else filter_rule_a
+    rule_param_b = None if filter_rule_b == 0 else filter_rule_b
+    barcode_param = filter_barcode if filter_barcode else None
+
+    with get_conn() as conn:
+        discs_a = []
+        discs_b = []
+        if rule_param_a:
+            discs_a = get_discrepancies_extended(
+                conn, store_id=store_param, status=status_param,
+                rule_version=rule_param_a, barcode=barcode_param,
+            )
+        if rule_param_b:
+            discs_b = get_discrepancies_extended(
+                conn, store_id=store_param, status=status_param,
+                rule_version=rule_param_b, barcode=barcode_param,
+            )
+        if not rule_param_a and not rule_param_b:
+            discs_a = get_discrepancies_extended(
+                conn, store_id=store_param, status=status_param,
+                barcode=barcode_param,
+            )
+
+    def _build_key_map(discs):
+        m = {}
+        for d in discs:
+            key = (d["store_id"], d["barcode"])
+            if key not in m:
+                m[key] = []
+            m[key].append(d)
+        return m
+
+    map_a = _build_key_map(discs_a)
+    map_b = _build_key_map(discs_b)
+    all_keys = sorted(set(map_a.keys()) | set(map_b.keys()))
+
+    if not all_keys:
+        st.info("暂无符合筛选条件的差异记录，请调整筛选条件或先导入数据并运行归因")
+    else:
+        summary_cols = st.columns(4)
+        with summary_cols[0]:
+            st.metric(f"版本A {'v'+str(filter_rule_a) if filter_rule_a else '(全部)'}", f"{len(discs_a)} 条差异")
+        with summary_cols[1]:
+            st.metric(f"版本B {'v'+str(filter_rule_b) if filter_rule_b else '(全部)'}", f"{len(discs_b)} 条差异")
+        with summary_cols[2]:
+            only_a = len(set(map_a.keys()) - set(map_b.keys()))
+            st.metric("仅版本A有", f"{only_a} 个商品")
+        with summary_cols[3]:
+            only_b = len(set(map_b.keys()) - set(map_a.keys()))
+            st.metric("仅版本B有", f"{only_b} 个商品")
+
+        if rule_param_a and rule_param_b:
+            diff_total = 0
+            changed_causes = 0
+            for key in all_keys:
+                if key in map_a and key in map_b:
+                    da = map_a[key][0]
+                    db = map_b[key][0]
+                    if abs(da["diff_qty"] - db["diff_qty"]) > 0.001:
+                        diff_total += 1
+                    if da.get("attributed_cause") != db.get("attributed_cause"):
+                        changed_causes += 1
+            sum_col2 = st.columns(2)
+            with sum_col2[0]:
+                st.metric("差异数量变化的商品", f"{diff_total} 个")
+            with sum_col2[1]:
+                st.metric("归因结果变化的商品", f"{changed_causes} 个")
+
+        st.divider()
+        st.subheader("📋 并排对比详情")
+
+        for key in all_keys:
+            store_id, barcode = key
+            list_a = map_a.get(key, [])
+            list_b = map_b.get(key, [])
+            da = list_a[0] if list_a else None
+            db = list_b[0] if list_b else None
+
+            sku_name = ""
+            if da:
+                sku_name = da.get("sku_name", "")
+            elif db:
+                sku_name = db.get("sku_name", "")
+
+            badge_a = ""
+            badge_b = ""
+            if da and db:
+                if abs(da["diff_qty"] - db["diff_qty"]) > 0.001:
+                    badge_a = " ⚠️ 差异量变化"
+                if da.get("attributed_cause") != db.get("attributed_cause"):
+                    badge_b = " ⚠️ 归因变化"
+            if da and not db:
+                badge_a = " 📌 仅A有"
+            if db and not da:
+                badge_b = " 🆕 仅B有"
+
+            with st.expander(
+                f"[{store_id}] {sku_name or barcode} "
+                f"{'| 版本A' + badge_a if da else ''} "
+                f"{'| 版本B' + badge_b if db else ''}"
+            ):
+                col_hdr1, col_hdr2 = st.columns(2)
+                with col_hdr1:
+                    label_a = f"版本A - 规则 v{da['rule_ver']}" if da else "版本A - 无记录"
+                    st.markdown(f"### {label_a}")
+                with col_hdr2:
+                    label_b = f"版本B - 规则 v{db['rule_ver']}" if db else "版本B - 无记录"
+                    st.markdown(f"### {label_b}")
+
+                col_alias1, col_alias2 = st.columns(2)
+                with col_alias1:
+                    if da:
+                        with get_conn() as conn:
+                            snap_a = get_snapshot_for_discrepancy(conn, da["id"])
+                        st.markdown("**🏷️ 别名映射**")
+                        if snap_a and snap_a.get("alias_before"):
+                            st.markdown(f"映射前: `{snap_a['alias_before']}` → 映射后: `{snap_a['alias_after']}`")
+                        else:
+                            st.markdown("无别名映射")
+                    else:
+                        st.markdown("—")
+                with col_alias2:
+                    if db:
+                        with get_conn() as conn:
+                            snap_b = get_snapshot_for_discrepancy(conn, db["id"])
+                        st.markdown("**🏷️ 别名映射**")
+                        if snap_b and snap_b.get("alias_before"):
+                            st.markdown(f"映射前: `{snap_b['alias_before']}` → 映射后: `{snap_b['alias_after']}`")
+                        else:
+                            st.markdown("无别名映射")
+                    else:
+                        st.markdown("—")
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    if da:
+                        cause_a = CAUSE_LABELS.get(da["attributed_cause"], da["attributed_cause"] or "未归因")
+                        st.markdown(f"**系统数量**: {da['system_qty']:.1f}")
+                        st.markdown(f"**实际数量**: {da['actual_qty']:.1f}")
+                        diff_style = "color: red" if da['diff_qty'] > 0 else "color: green"
+                        st.markdown(f"**差异数量**: <span style='{diff_style}'>{da['diff_qty']:+.1f}</span>", unsafe_allow_html=True)
+                        st.markdown(f"**归因**: {cause_a}")
+                        st.markdown(f"**归因详情**: {da.get('cause_detail', '-')}")
+                        st.markdown(f"**状态**: {STATUS_LABELS.get(da['status'], da['status'])}")
+                        st.markdown(f"**规则版本**: v{da.get('rule_ver', '-')}")
+                        if da.get("review_note"):
+                            st.markdown(f"**复核备注**: {da['review_note']}")
+                        st.markdown(f"**创建时间**: {da['created_at'][:19]}")
+                        st.markdown(_status_badge(da["status"]), unsafe_allow_html=True)
+                    else:
+                        st.markdown("*此版本无该商品记录*")
+                with col2:
+                    if db:
+                        cause_b = CAUSE_LABELS.get(db["attributed_cause"], db["attributed_cause"] or "未归因")
+                        st.markdown(f"**系统数量**: {db['system_qty']:.1f}")
+                        st.markdown(f"**实际数量**: {db['actual_qty']:.1f}")
+                        diff_style = "color: red" if db['diff_qty'] > 0 else "color: green"
+                        st.markdown(f"**差异数量**: <span style='{diff_style}'>{db['diff_qty']:+.1f}</span>", unsafe_allow_html=True)
+                        st.markdown(f"**归因**: {cause_b}")
+                        st.markdown(f"**归因详情**: {db.get('cause_detail', '-')}")
+                        st.markdown(f"**状态**: {STATUS_LABELS.get(db['status'], db['status'])}")
+                        st.markdown(f"**规则版本**: v{db.get('rule_ver', '-')}")
+                        if db.get("review_note"):
+                            st.markdown(f"**复核备注**: {db['review_note']}")
+                        st.markdown(f"**创建时间**: {db['created_at'][:19]}")
+                        st.markdown(_status_badge(db["status"]), unsafe_allow_html=True)
+                    else:
+                        st.markdown("*此版本无该商品记录*")
+
+                if da and db:
+                    if abs(da["diff_qty"] - db["diff_qty"]) > 0.001 or da.get("attributed_cause") != db.get("attributed_cause"):
+                        st.warning("⚠️ 两个版本间存在差异")
+                        delta_qty = db["diff_qty"] - da["diff_qty"]
+                        st.markdown(f"- **差异量变化**: {da['diff_qty']:+.1f} → {db['diff_qty']:+.1f} (Δ {delta_qty:+.1f})")
+                        if da.get("attributed_cause") != db.get("attributed_cause"):
+                            st.markdown(f"- **归因变化**: {CAUSE_LABELS.get(da['attributed_cause'], '未归因')} → {CAUSE_LABELS.get(db['attributed_cause'], '未归因')}")
+
+                st.divider()
+                st.markdown("**🧾 归因快照对比（当时生效规则）**")
+                col_snap1, col_snap2 = st.columns(2)
+                with col_snap1:
+                    if da:
+                        with get_conn() as conn:
+                            snap_a = get_snapshot_for_discrepancy(conn, da["id"])
+                            steps_a = get_calc_steps_for_discrepancy(conn, da["id"])
+                        if snap_a:
+                            cfg_a = snap_a.get("rule_config_snapshot", {}) or {}
+                            st.markdown(f"**损耗阈值**: {cfg_a.get('loss_threshold_pct', '-')}% / 绝对值 {cfg_a.get('loss_threshold_abs', '-')}")
+                            st.markdown(f"**调拨延迟窗口**: {cfg_a.get('transfer_delay_days', '-')} 天")
+                            aliases_a = cfg_a.get("aliases", {})
+                            if aliases_a:
+                                st.markdown(f"**别名映射规则**: `{json.dumps(aliases_a, ensure_ascii=False)}`")
+                            st.markdown(f"**快照生成时间**: {snap_a.get('created_at', '')[:19]}")
+                            with st.expander(f"📊 计算步骤 ({len(steps_a)} 步)", expanded=False):
+                                for cs in steps_a:
+                                    step_label = {
+                                        "init": "🔢 初始", "sales": "🛒 销售", "transfer_out": "📤 调出",
+                                        "transfer_in": "📥 调入", "normal_loss": "⚖️ 损耗",
+                                        "unknown_loss": "❓ 缺失", "unknown_surplus": "📈 盘盈",
+                                    }.get(cs["step_type"], cs["step_type"])
+                                    if cs["step_type"] == "init":
+                                        st.markdown(f"{step_label}: {cs['step_description']}")
+                                    else:
+                                        st.markdown(f"{step_label}: {cs['step_description']} (扣{cs['amount_applied']:+.1f}, 剩{cs['remaining_after']:.1f})")
+                        else:
+                            st.markdown("*无快照*")
+                    else:
+                        st.markdown("—")
+                with col_snap2:
+                    if db:
+                        with get_conn() as conn:
+                            snap_b = get_snapshot_for_discrepancy(conn, db["id"])
+                            steps_b = get_calc_steps_for_discrepancy(conn, db["id"])
+                        if snap_b:
+                            cfg_b = snap_b.get("rule_config_snapshot", {}) or {}
+                            st.markdown(f"**损耗阈值**: {cfg_b.get('loss_threshold_pct', '-')}% / 绝对值 {cfg_b.get('loss_threshold_abs', '-')}")
+                            st.markdown(f"**调拨延迟窗口**: {cfg_b.get('transfer_delay_days', '-')} 天")
+                            aliases_b = cfg_b.get("aliases", {})
+                            if aliases_b:
+                                st.markdown(f"**别名映射规则**: `{json.dumps(aliases_b, ensure_ascii=False)}`")
+                            st.markdown(f"**快照生成时间**: {snap_b.get('created_at', '')[:19]}")
+                            with st.expander(f"📊 计算步骤 ({len(steps_b)} 步)", expanded=False):
+                                for cs in steps_b:
+                                    step_label = {
+                                        "init": "🔢 初始", "sales": "🛒 销售", "transfer_out": "📤 调出",
+                                        "transfer_in": "📥 调入", "normal_loss": "⚖️ 损耗",
+                                        "unknown_loss": "❓ 缺失", "unknown_surplus": "📈 盘盈",
+                                    }.get(cs["step_type"], cs["step_type"])
+                                    if cs["step_type"] == "init":
+                                        st.markdown(f"{step_label}: {cs['step_description']}")
+                                    else:
+                                        st.markdown(f"{step_label}: {cs['step_description']} (扣{cs['amount_applied']:+.1f}, 剩{cs['remaining_after']:.1f})")
+                        else:
+                            st.markdown("*无快照*")
+                    else:
+                        st.markdown("—")
+
+        st.divider()
+        st.subheader("📤 导出对比结果（含筛选条件+对比摘要）")
+
+        export_format_rv = st.radio("导出格式", ["CSV", "JSON"], horizontal=True, key="export_format_rv")
+
+        all_export_data = []
+        for key in all_keys:
+            store_id, barcode = key
+            list_a = map_a.get(key, [])
+            list_b = map_b.get(key, [])
+            da = list_a[0] if list_a else None
+            db = list_b[0] if list_b else None
+
+            row = {
+                "store_id": store_id,
+                "barcode": barcode,
+                "sku_name": "",
+            }
+
+            if da:
+                row["sku_name"] = da.get("sku_name", "")
+                row["v_a_rule_ver"] = da.get("rule_ver", "")
+                row["v_a_system_qty"] = da["system_qty"]
+                row["v_a_actual_qty"] = da["actual_qty"]
+                row["v_a_diff_qty"] = da["diff_qty"]
+                row["v_a_cause"] = CAUSE_LABELS.get(da["attributed_cause"], da["attributed_cause"] or "未归因")
+                row["v_a_cause_detail"] = da.get("cause_detail", "")
+                row["v_a_status"] = STATUS_LABELS.get(da["status"], da["status"])
+                row["v_a_review_note"] = da.get("review_note", "")
+                row["v_a_created_at"] = da["created_at"]
+            else:
+                row["v_a_rule_ver"] = ""
+                row["v_a_system_qty"] = ""
+                row["v_a_actual_qty"] = ""
+                row["v_a_diff_qty"] = ""
+                row["v_a_cause"] = "无记录"
+                row["v_a_cause_detail"] = ""
+                row["v_a_status"] = ""
+                row["v_a_review_note"] = ""
+                row["v_a_created_at"] = ""
+
+            if db:
+                if not row["sku_name"]:
+                    row["sku_name"] = db.get("sku_name", "")
+                row["v_b_rule_ver"] = db.get("rule_ver", "")
+                row["v_b_system_qty"] = db["system_qty"]
+                row["v_b_actual_qty"] = db["actual_qty"]
+                row["v_b_diff_qty"] = db["diff_qty"]
+                row["v_b_cause"] = CAUSE_LABELS.get(db["attributed_cause"], db["attributed_cause"] or "未归因")
+                row["v_b_cause_detail"] = db.get("cause_detail", "")
+                row["v_b_status"] = STATUS_LABELS.get(db["status"], db["status"])
+                row["v_b_review_note"] = db.get("review_note", "")
+                row["v_b_created_at"] = db["created_at"]
+            else:
+                row["v_b_rule_ver"] = ""
+                row["v_b_system_qty"] = ""
+                row["v_b_actual_qty"] = ""
+                row["v_b_diff_qty"] = ""
+                row["v_b_cause"] = "无记录"
+                row["v_b_cause_detail"] = ""
+                row["v_b_status"] = ""
+                row["v_b_review_note"] = ""
+                row["v_b_created_at"] = ""
+
+            if da and db:
+                row["diff_qty_change"] = db["diff_qty"] - da["diff_qty"]
+                row["cause_changed"] = "是" if da.get("attributed_cause") != db.get("attributed_cause") else "否"
+            else:
+                row["diff_qty_change"] = ""
+                row["cause_changed"] = ""
+
+            all_export_data.append(row)
+
+        filter_summary = {
+            "exported_at": now_iso(),
+            "filter_store": filter_store,
+            "filter_barcode": filter_barcode,
+            "filter_status": filter_status,
+            "filter_rule_a": filter_rule_a,
+            "filter_rule_b": filter_rule_b,
+            "summary": {
+                "total_items": len(all_keys),
+                "count_version_a": len(discs_a),
+                "count_version_b": len(discs_b),
+                "only_in_a": len(set(map_a.keys()) - set(map_b.keys())),
+                "only_in_b": len(set(map_b.keys()) - set(map_a.keys())),
+            }
+        }
+
+        if rule_param_a and rule_param_b:
+            diff_qty_count = sum(1 for r in all_export_data if r.get("diff_qty_change") and abs(r["diff_qty_change"]) > 0.001)
+            cause_change_count = sum(1 for r in all_export_data if r.get("cause_changed") == "是")
+            filter_summary["summary"]["diff_qty_changed"] = diff_qty_count
+            filter_summary["summary"]["cause_changed"] = cause_change_count
+
+        if all_export_data:
+            if export_format_rv == "CSV":
+                df_rv = pd.DataFrame(all_export_data)
+                df_rv.insert(0, "filter_store", filter_store)
+                df_rv.insert(1, "filter_barcode", filter_barcode)
+                df_rv.insert(2, "filter_rule_a", f"v{filter_rule_a}" if filter_rule_a else "全部")
+                df_rv.insert(3, "filter_rule_b", f"v{filter_rule_b}" if filter_rule_b else "全部")
+                df_rv.insert(4, "filter_status", filter_status)
+
+                col_map = {
+                    "filter_store": "筛选-门店",
+                    "filter_barcode": "筛选-商品",
+                    "filter_rule_a": "筛选-规则版本A",
+                    "filter_rule_b": "筛选-规则版本B",
+                    "filter_status": "筛选-状态",
+                    "store_id": "门店",
+                    "barcode": "条码",
+                    "sku_name": "商品名称",
+                    "v_a_rule_ver": "版本A-规则版本",
+                    "v_a_system_qty": "版本A-系统数量",
+                    "v_a_actual_qty": "版本A-实际数量",
+                    "v_a_diff_qty": "版本A-差异数量",
+                    "v_a_cause": "版本A-归因",
+                    "v_a_cause_detail": "版本A-归因详情",
+                    "v_a_status": "版本A-状态",
+                    "v_a_review_note": "版本A-复核备注",
+                    "v_a_created_at": "版本A-创建时间",
+                    "v_b_rule_ver": "版本B-规则版本",
+                    "v_b_system_qty": "版本B-系统数量",
+                    "v_b_actual_qty": "版本B-实际数量",
+                    "v_b_diff_qty": "版本B-差异数量",
+                    "v_b_cause": "版本B-归因",
+                    "v_b_cause_detail": "版本B-归因详情",
+                    "v_b_status": "版本B-状态",
+                    "v_b_review_note": "版本B-复核备注",
+                    "v_b_created_at": "版本B-创建时间",
+                    "diff_qty_change": "差异量变化",
+                    "cause_changed": "归因是否变化",
+                }
+                existing = [c for c in col_map if c in df_rv.columns]
+                df_rv = df_rv[existing]
+                df_rv.columns = [col_map[c] for c in existing]
+
+                csv_buf = io.StringIO()
+                df_rv.to_csv(csv_buf, index=False, encoding="utf-8-sig")
+                csv_content = csv_buf.getvalue()
+
+                summary_lines = [
+                    "# 差异复盘对比导出",
+                    f"# 导出时间: {filter_summary['exported_at']}",
+                    f"# 筛选条件: 门店={filter_summary['filter_store']}, 商品={filter_summary['filter_barcode']}, "
+                    f"规则A=v{filter_summary['filter_rule_a'] if filter_summary['filter_rule_a'] else '全部'}, "
+                    f"规则B=v{filter_summary['filter_rule_b'] if filter_summary['filter_rule_b'] else '全部'}, "
+                    f"状态={filter_summary['filter_status']}",
+                    f"# 对比摘要: {json.dumps(filter_summary['summary'], ensure_ascii=False)}",
+                    "#",
+                ]
+                full_csv = "\n".join(summary_lines) + csv_content
+
+                st.download_button(
+                    "⬇️ 下载 CSV（含筛选条件+对比摘要+并排版本）",
+                    data=full_csv.encode("utf-8-sig"),
+                    file_name=f"discrepancy_compare_{now_iso()[:10]}.csv",
+                    mime="text/csv",
+                )
+
+                st.dataframe(df_rv, use_container_width=True, hide_index=True)
+            else:
+                json_export = {
+                    "export_metadata": filter_summary,
+                    "comparison_data": all_export_data,
+                    "rule_versions_info": [
+                        {"version": v["version"], "config": json.loads(v["config_json"]), "created_at": v["created_at"]}
+                        for v in rule_versions
+                    ],
+                }
+                json_str = json.dumps(json_export, ensure_ascii=False, indent=2, default=str)
+                st.download_button(
+                    "⬇️ 下载 JSON（含筛选条件+对比摘要+规则版本+完整数据）",
+                    data=json_str.encode("utf-8"),
+                    file_name=f"discrepancy_compare_{now_iso()[:10]}.json",
+                    mime="application/json",
+                )
+                with st.expander("📋 预览导出内容（含筛选条件和对比摘要）", expanded=False):
+                    st.json(json_export)
+        else:
+            st.info("暂无数据可导出")

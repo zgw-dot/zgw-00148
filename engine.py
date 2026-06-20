@@ -130,7 +130,7 @@ def run_attribution():
             alias_before = ", ".join(sorted([b for b in all_raw_bc if b != barcode])) or None
             alias_after = barcode if alias_before else None
 
-            existing = get_discrepancy_by_business_key(conn, store_id, barcode)
+            existing = get_discrepancy_by_business_key(conn, store_id, barcode, rule_rec["id"])
             if existing:
                 skipped += 1
                 continue

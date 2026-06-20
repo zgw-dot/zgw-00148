@@ -2,7 +2,10 @@ import csv
 import hashlib
 import io
 import json
-from db import get_conn, now_iso, get_active_rule_version, resolve_barcode, DEFAULT_RULES
+from db import (
+    get_conn, now_iso, get_active_rule_version, resolve_barcode, DEFAULT_RULES,
+    check_import_duplicate, get_discrepancies,
+)
 
 REQUIRED_FIELDS = {
     "inventory": ["store_id", "barcode", "sku_name", "system_qty"],
@@ -74,22 +77,69 @@ def _defensive_check(import_type, line_num, row):
     return None
 
 
-def import_csv(import_type, file_name, content_bytes):
+def import_csv(import_type, file_name, content_bytes, allow_different_rule_version=False):
     if isinstance(content_bytes, str):
         content_bytes = content_bytes.encode("utf-8")
 
     file_hash = compute_file_hash(content_bytes)
 
     with get_conn() as conn:
-        existing = conn.execute(
-            "SELECT id FROM import_records WHERE file_hash = ? AND import_type = ?",
-            (file_hash, import_type),
-        ).fetchone()
-        if existing:
+        rule_rec = get_active_rule_version(conn)
+        if not rule_rec:
+            from engine import _ensure_default_rule
+            _ensure_default_rule(conn)
+            rule_rec = get_active_rule_version(conn)
+
+        import json as _json
+        rule_cfg = _json.loads(rule_rec["config_json"])
+        current_rule_version_id = rule_rec["id"]
+        current_rule_version = rule_rec["version"]
+
+        existing_all = check_import_duplicate(conn, file_hash, import_type)
+        existing_same_rule = check_import_duplicate(conn, file_hash, import_type, current_rule_version_id)
+
+        if existing_same_rule:
+            dup = existing_same_rule[0]
             return {
                 "success": False,
-                "error": f"文件 '{file_name}' 已导入过（哈希: {file_hash[:8]}...），不会重复生成差异",
+                "error": (f"文件 '{file_name}' 已在规则 v{current_rule_version} 下导入过 "
+                         f"（导入时间: {dup['imported_at'][:19]}，有效行: {dup['row_count']}）。"
+                         f" 如需重新导入，请先删除历史记录或使用不同的规则版本。"),
                 "duplicate": True,
+                "duplicate_type": "same_rule_version",
+                "existing_records": existing_all,
+                "current_rule_version": current_rule_version,
+            }
+
+        if existing_all and not allow_different_rule_version:
+            dup = existing_all[0]
+            dup_ver = "未知"
+            if dup.get("rule_version_id"):
+                dup_rule_ver = conn.execute(
+                    "SELECT version FROM rule_versions WHERE id = ?", (dup["rule_version_id"],)
+                ).fetchone()
+                if dup_rule_ver:
+                    dup_ver = dup_rule_ver["version"]
+
+            existing_disc_count = 0
+            if import_type in ["inventory", "stocktake"]:
+                existing_discs = get_discrepancies(conn)
+                existing_disc_count = len(existing_discs)
+
+            return {
+                "success": False,
+                "error": (f"⚠️ 导入冲突提醒：文件 '{file_name}' 已在规则 v{dup_ver} 下导入过 "
+                         f"（导入时间: {dup['imported_at'][:19]}）。\n"
+                         f"当前生效规则为 v{current_rule_version}，与历史导入的规则版本不同。\n"
+                         f"继续导入将基于 v{current_rule_version} 规则生成新的差异记录，"
+                         f"与旧规则 v{dup_ver} 的记录分开存储，不会覆盖。\n"
+                         f"历史差异记录数: {existing_disc_count} 条。"),
+                "duplicate": True,
+                "duplicate_type": "different_rule_version",
+                "existing_records": existing_all,
+                "current_rule_version": current_rule_version,
+                "existing_rule_version": dup_ver,
+                "existing_disc_count": existing_disc_count,
             }
 
         text = content_bytes.decode("utf-8-sig")
@@ -130,17 +180,11 @@ def import_csv(import_type, file_name, content_bytes):
 
         now = now_iso()
         conn.execute(
-            "INSERT INTO import_records (file_hash, file_name, import_type, imported_at, row_count, error_count) VALUES (?, ?, ?, ?, ?, ?)",
-            (file_hash, file_name, import_type, now, len(valid_rows), len(all_errors)),
+            "INSERT INTO import_records (file_hash, file_name, import_type, imported_at, row_count, error_count, rule_version_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (file_hash, file_name, import_type, now, len(valid_rows), len(all_errors), current_rule_version_id),
         )
         import_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
-        rule_rec = get_active_rule_version(conn)
-        if rule_rec:
-            import json as _json
-            rule_cfg = _json.loads(rule_rec["config_json"])
-        else:
-            rule_cfg = DEFAULT_RULES.copy()
         aliases = rule_cfg.get("aliases", {})
 
         insert_count = 0
@@ -206,6 +250,8 @@ def import_csv(import_type, file_name, content_bytes):
             "valid_rows": insert_count,
             "error_rows": len(all_errors),
             "detail_errors": all_errors if all_errors else None,
+            "rule_version": current_rule_version,
+            "rule_version_id": current_rule_version_id,
         }
 
 

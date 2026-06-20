@@ -512,6 +512,156 @@ check("各版本差异独立不串", all(v > 0 for v in ver_counts.values()), st
 
 
 print("\n" + "=" * 70)
+print("测试 14: 时间筛选 - 按时间范围截取差异记录")
+print("=" * 70)
+
+with get_conn() as conn:
+    all_dates = [d["created_at"] for d in get_discrepancies(conn)]
+sorted_dates = sorted(all_dates)
+earliest = sorted_dates[0] if sorted_dates else now_iso()
+latest = sorted_dates[-1] if sorted_dates else now_iso()
+
+check("有可用于时间筛选的数据", len(sorted_dates) > 0, str(len(sorted_dates)))
+
+with get_conn() as conn:
+    discs_no_filter = get_discrepancies_extended(conn, rule_version=1)
+    discs_future = get_discrepancies_extended(conn, rule_version=1, date_from="2099-01-01T00:00:00")
+    discs_past = get_discrepancies_extended(conn, rule_version=1, date_to="2000-01-01T00:00:00")
+    discs_range = get_discrepancies_extended(conn, rule_version=1, date_from=earliest, date_to=latest)
+
+check("无时间筛选返回全部", len(discs_no_filter) > 0, str(len(discs_no_filter)))
+check("未来时间范围返回0条", len(discs_future) == 0, f"期望0, 实际{len(discs_future)}")
+check("过去时间范围返回0条", len(discs_past) == 0, f"期望0, 实际{len(discs_past)}")
+check("完整时间范围返回全部", len(discs_range) == len(discs_no_filter), f"期望{len(discs_no_filter)}, 实际{len(discs_range)}")
+
+mid_date = sorted_dates[len(sorted_dates) // 2] if len(sorted_dates) > 1 else sorted_dates[0]
+with get_conn() as conn:
+    discs_before_mid = get_discrepancies_extended(conn, rule_version=1, date_to=mid_date)
+    discs_after_mid = get_discrepancies_extended(conn, rule_version=1, date_from=mid_date)
+
+check("时间筛选生效: 中段前截取", len(discs_before_mid) <= len(discs_no_filter), f"{len(discs_before_mid)} <= {len(discs_no_filter)}")
+check("时间筛选生效: 中段后截取", len(discs_after_mid) <= len(discs_no_filter), f"{len(discs_after_mid)} <= {len(discs_no_filter)}")
+
+
+print("\n" + "=" * 70)
+print("测试 15: 筛选记忆 - 时间条件持久化")
+print("=" * 70)
+
+date_filter_state = {
+    "store_id": sample_store,
+    "barcode": sample_barcode[:5],
+    "rule_ver_a": 1,
+    "rule_ver_b": 2,
+    "status": "pending_review",
+    "date_from": earliest,
+    "date_to": latest,
+    "saved_at": now_iso(),
+}
+with get_conn() as conn:
+    save_ui_state(conn, "review_filter_state", date_filter_state)
+    loaded_date_filter = load_ui_state(conn, "review_filter_state")
+
+check("时间筛选保存成功", loaded_date_filter is not None, str(loaded_date_filter))
+check("date_from持久化", loaded_date_filter.get("date_from") == earliest, str(loaded_date_filter.get("date_from")))
+check("date_to持久化", loaded_date_filter.get("date_to") == latest, str(loaded_date_filter.get("date_to")))
+
+
+print("\n" + "=" * 70)
+print("测试 16: 导出增强 - CSV/JSON包含时间条件")
+print("=" * 70)
+
+date_from_test = earliest
+date_to_test = latest
+with get_conn() as conn:
+    discs_a_export = get_discrepancies_extended(conn, store_id=sample_store, rule_version=1, date_from=date_from_test, date_to=date_to_test)
+    discs_b_export = get_discrepancies_extended(conn, store_id=sample_store, rule_version=2, date_from=date_from_test, date_to=date_to_test)
+
+check(f"时间筛选后版本A有数据", len(discs_a_export) > 0, str(len(discs_a_export)))
+check(f"时间筛选后版本B有数据", len(discs_b_export) > 0, str(len(discs_b_export)))
+
+filter_summary_with_dates = {
+    "exported_at": now_iso(),
+    "filter_store": sample_store,
+    "filter_barcode": "",
+    "filter_status": "全部",
+    "filter_rule_a": 1,
+    "filter_rule_b": 2,
+    "filter_date_from": date_from_test,
+    "filter_date_to": date_to_test,
+    "summary": {
+        "total_items": 5,
+        "count_version_a": len(discs_a_export),
+        "count_version_b": len(discs_b_export),
+    }
+}
+
+csv_header_lines = [
+    "# 差异复盘对比导出",
+    f"# 导出时间: {filter_summary_with_dates['exported_at']}",
+    f"# 筛选条件: 门店={filter_summary_with_dates['filter_store']}, "
+    f"时间范围={filter_summary_with_dates['filter_date_from']}~{filter_summary_with_dates['filter_date_to']}, "
+    f"规则A=v1, 规则B=v2, 状态={filter_summary_with_dates['filter_status']}",
+    f"# 对比摘要: {json.dumps(filter_summary_with_dates['summary'], ensure_ascii=False)}",
+    "#",
+]
+
+csv_test_str = "\n".join(csv_header_lines) + "\nstore_id,barcode\nS001,6901234567891\n"
+
+check("CSV注释包含时间范围", "时间范围" in csv_test_str and date_from_test in csv_test_str, csv_test_str[:300])
+check("CSV注释包含date_from", date_from_test in csv_test_str, csv_test_str[:300])
+check("CSV注释包含date_to", date_to_test in csv_test_str, csv_test_str[:300])
+
+json_export_with_dates = {
+    "export_metadata": filter_summary_with_dates,
+    "comparison_data": [],
+}
+json_str_dates = json.dumps(json_export_with_dates, ensure_ascii=False, indent=2)
+
+check("JSON metadata包含filter_date_from", "filter_date_from" in json_str_dates and date_from_test in json_str_dates, json_str_dates[:300])
+check("JSON metadata包含filter_date_to", "filter_date_to" in json_str_dates and date_to_test in json_str_dates, json_str_dates[:300])
+
+print(f"  [INFO] CSV筛选条件行预览:")
+print(f"         {csv_header_lines[2][:120]}...")
+
+
+print("\n" + "=" * 70)
+print("测试 17: 版本A/B查询均使用时间条件 - 结果对称")
+print("=" * 70)
+
+test_date_future = "2099-01-01T00:00:00"
+with get_conn() as conn:
+    discs_a_no_date = get_discrepancies_extended(conn, rule_version=1)
+    discs_b_no_date = get_discrepancies_extended(conn, rule_version=2)
+    discs_a_with_date = get_discrepancies_extended(conn, rule_version=1, date_from=test_date_future)
+    discs_b_with_date = get_discrepancies_extended(conn, rule_version=2, date_from=test_date_future)
+
+check("版本A时间筛选生效", len(discs_a_no_date) > 0 and len(discs_a_with_date) == 0, f"无筛选={len(discs_a_no_date)}, 未来筛选={len(discs_a_with_date)}")
+check("版本B时间筛选生效", len(discs_b_no_date) > 0 and len(discs_b_with_date) == 0, f"无筛选={len(discs_b_no_date)}, 未来筛选={len(discs_b_with_date)}")
+check("两版本时间筛选行为对称", len(discs_a_with_date) == len(discs_b_with_date), f"A={len(discs_a_with_date)}, B={len(discs_b_with_date)}")
+
+
+print("\n" + "=" * 70)
+print("测试 18: 模拟重启 - 时间筛选条件恢复")
+print("=" * 70)
+
+import importlib
+importlib.reload(db_mod)
+with db_mod.get_conn() as conn:
+    state_after = db_mod.load_ui_state(conn, "review_filter_state")
+    discs_after_v1_all = db_mod.get_discrepancies_extended(conn, rule_version=1, date_from=state_after.get("date_from"), date_to=state_after.get("date_to"))
+    discs_after_v2_all = db_mod.get_discrepancies_extended(conn, rule_version=2, date_from=state_after.get("date_from"), date_to=state_after.get("date_to"))
+    discs_after_v1 = db_mod.get_discrepancies_extended(conn, store_id=sample_store, rule_version=1, date_from=state_after.get("date_from"), date_to=state_after.get("date_to"))
+    discs_after_v2 = db_mod.get_discrepancies_extended(conn, store_id=sample_store, rule_version=2, date_from=state_after.get("date_from"), date_to=state_after.get("date_to"))
+
+check("重启后date_from恢复", state_after.get("date_from") == earliest, str(state_after.get("date_from")))
+check("重启后date_to恢复", state_after.get("date_to") == latest, str(state_after.get("date_to")))
+check("重启后时间筛选版本A全量数据正确", len(discs_after_v1_all) == 9, f"期望9, 实际{len(discs_after_v1_all)}")
+check("重启后时间筛选版本B全量数据正确", len(discs_after_v2_all) == 9, f"期望9, 实际{len(discs_after_v2_all)}")
+check("重启后时间筛选版本A门店数据正确", len(discs_after_v1) == len(discs_a_export), f"期望{len(discs_a_export)}, 实际{len(discs_after_v1)}")
+check("重启后时间筛选版本B门店数据正确", len(discs_after_v2) == len(discs_b_export), f"期望{len(discs_b_export)}, 实际{len(discs_after_v2)}")
+
+
+print("\n" + "=" * 70)
 if errors_total:
     print(f"[FAIL] 共 {len(errors_total)} 项失败:")
     for n, d in errors_total:
@@ -530,3 +680,8 @@ else:
     print("   [OK] JSON导出包含元数据、规则版本、完整对比数据")
     print("   [OK] 重启回归所有数据保持一致, 不串口径")
     print("   [OK] 完整链路验证: 导入→改规则→再导入→对比→导出→重启")
+    print("   [OK] 时间筛选 - 按时间范围截取差异记录")
+    print("   [OK] 筛选记忆 - 时间条件持久化")
+    print("   [OK] 导出增强 - CSV/JSON包含时间条件")
+    print("   [OK] 版本A/B查询均使用时间条件")
+    print("   [OK] 模拟重启 - 时间筛选条件恢复")

@@ -715,6 +715,8 @@ with tab6:
         st.session_state.review_rule_ver_a = saved_state.get("rule_ver_a", 0)
         st.session_state.review_rule_ver_b = saved_state.get("rule_ver_b", 0)
         st.session_state.review_status = saved_state.get("status", "全部")
+        st.session_state.review_date_from = saved_state.get("date_from", "")
+        st.session_state.review_date_to = saved_state.get("date_to", "")
         st.session_state.review_filter_init = True
 
     st.subheader("🔍 筛选条件")
@@ -755,6 +757,20 @@ with tab6:
             format_func=lambda x: rv_display_b[x],
             key="review_rule_ver_b",
         )
+        date_from_val = st.text_input(
+            "开始时间 (YYYY-MM-DD或ISO格式，留空不限)",
+            value=st.session_state.get("review_date_from", ""),
+            key="review_date_from",
+            placeholder="如 2026-01-01 或 2026-01-01T00:00:00",
+        )
+        date_to_val = st.text_input(
+            "结束时间 (YYYY-MM-DD或ISO格式，留空不限)",
+            value=st.session_state.get("review_date_to", ""),
+            key="review_date_to",
+            placeholder="如 2026-12-31 或 2026-12-31T23:59:59",
+        )
+        if date_range:
+            st.caption(f"📅 数据时间范围: {date_range.get('min_date','')[:10]} ~ {date_range.get('max_date','')[:10]}")
 
     col_btn1, col_btn2, _ = st.columns([1, 1, 3])
     with col_btn1:
@@ -765,6 +781,8 @@ with tab6:
                 "rule_ver_a": filter_rule_a,
                 "rule_ver_b": filter_rule_b,
                 "status": filter_status,
+                "date_from": date_from_val,
+                "date_to": date_to_val,
                 "saved_at": now_iso(),
             }
             with get_conn() as conn:
@@ -774,7 +792,7 @@ with tab6:
         if st.button("🔄 重置筛选", key="reset_filter"):
             if "review_filter_init" in st.session_state:
                 del st.session_state.review_filter_init
-            for k in ["review_store", "review_barcode", "review_rule_ver_a", "review_rule_ver_b", "review_status"]:
+            for k in ["review_store", "review_barcode", "review_rule_ver_a", "review_rule_ver_b", "review_status", "review_date_from", "review_date_to"]:
                 if k in st.session_state:
                     del st.session_state[k]
             with get_conn() as conn:
@@ -791,6 +809,8 @@ with tab6:
     rule_param_a = None if filter_rule_a == 0 else filter_rule_a
     rule_param_b = None if filter_rule_b == 0 else filter_rule_b
     barcode_param = filter_barcode if filter_barcode else None
+    date_from_param = date_from_val if date_from_val and date_from_val.strip() else None
+    date_to_param = date_to_val if date_to_val and date_to_val.strip() else None
 
     with get_conn() as conn:
         discs_a = []
@@ -799,16 +819,19 @@ with tab6:
             discs_a = get_discrepancies_extended(
                 conn, store_id=store_param, status=status_param,
                 rule_version=rule_param_a, barcode=barcode_param,
+                date_from=date_from_param, date_to=date_to_param,
             )
         if rule_param_b:
             discs_b = get_discrepancies_extended(
                 conn, store_id=store_param, status=status_param,
                 rule_version=rule_param_b, barcode=barcode_param,
+                date_from=date_from_param, date_to=date_to_param,
             )
         if not rule_param_a and not rule_param_b:
             discs_a = get_discrepancies_extended(
                 conn, store_id=store_param, status=status_param,
                 barcode=barcode_param,
+                date_from=date_from_param, date_to=date_to_param,
             )
 
     def _build_key_map(discs):
@@ -1105,6 +1128,8 @@ with tab6:
             "filter_status": filter_status,
             "filter_rule_a": filter_rule_a,
             "filter_rule_b": filter_rule_b,
+            "filter_date_from": date_from_param or "",
+            "filter_date_to": date_to_param or "",
             "summary": {
                 "total_items": len(all_keys),
                 "count_version_a": len(discs_a),
@@ -1121,20 +1146,24 @@ with tab6:
             filter_summary["summary"]["cause_changed"] = cause_change_count
 
         if all_export_data:
-            if export_format_rv == "CSV":
-                df_rv = pd.DataFrame(all_export_data)
-                df_rv.insert(0, "filter_store", filter_store)
-                df_rv.insert(1, "filter_barcode", filter_barcode)
-                df_rv.insert(2, "filter_rule_a", f"v{filter_rule_a}" if filter_rule_a else "全部")
-                df_rv.insert(3, "filter_rule_b", f"v{filter_rule_b}" if filter_rule_b else "全部")
-                df_rv.insert(4, "filter_status", filter_status)
+                if export_format_rv == "CSV":
+                    df_rv = pd.DataFrame(all_export_data)
+                    df_rv.insert(0, "filter_store", filter_store)
+                    df_rv.insert(1, "filter_barcode", filter_barcode)
+                    df_rv.insert(2, "filter_rule_a", f"v{filter_rule_a}" if filter_rule_a else "全部")
+                    df_rv.insert(3, "filter_rule_b", f"v{filter_rule_b}" if filter_rule_b else "全部")
+                    df_rv.insert(4, "filter_status", filter_status)
+                    df_rv.insert(5, "filter_date_from", date_from_param or "不限")
+                    df_rv.insert(6, "filter_date_to", date_to_param or "不限")
 
-                col_map = {
-                    "filter_store": "筛选-门店",
-                    "filter_barcode": "筛选-商品",
-                    "filter_rule_a": "筛选-规则版本A",
-                    "filter_rule_b": "筛选-规则版本B",
-                    "filter_status": "筛选-状态",
+                    col_map = {
+                        "filter_store": "筛选-门店",
+                        "filter_barcode": "筛选-商品",
+                        "filter_rule_a": "筛选-规则版本A",
+                        "filter_rule_b": "筛选-规则版本B",
+                        "filter_status": "筛选-状态",
+                        "filter_date_from": "筛选-开始时间",
+                        "filter_date_to": "筛选-结束时间",
                     "store_id": "门店",
                     "barcode": "条码",
                     "sku_name": "商品名称",
@@ -1167,10 +1196,13 @@ with tab6:
                 df_rv.to_csv(csv_buf, index=False, encoding="utf-8-sig")
                 csv_content = csv_buf.getvalue()
 
+                date_from_display = filter_summary.get("filter_date_from") or "不限"
+                date_to_display = filter_summary.get("filter_date_to") or "不限"
                 summary_lines = [
                     "# 差异复盘对比导出",
                     f"# 导出时间: {filter_summary['exported_at']}",
                     f"# 筛选条件: 门店={filter_summary['filter_store']}, 商品={filter_summary['filter_barcode']}, "
+                    f"时间范围={date_from_display}~{date_to_display}, "
                     f"规则A=v{filter_summary['filter_rule_a'] if filter_summary['filter_rule_a'] else '全部'}, "
                     f"规则B=v{filter_summary['filter_rule_b'] if filter_summary['filter_rule_b'] else '全部'}, "
                     f"状态={filter_summary['filter_status']}",

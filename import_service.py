@@ -5,10 +5,10 @@ import json
 from db import get_conn, now_iso
 
 REQUIRED_FIELDS = {
-    "inventory": ["store_id", "barcode", "system_qty"],
-    "sales": ["store_id", "barcode", "sale_qty", "sale_date"],
-    "transfer": ["store_id_from", "store_id_to", "barcode", "transfer_qty", "transfer_date"],
-    "stocktake": ["store_id", "barcode", "actual_qty"],
+    "inventory": ["store_id", "barcode", "sku_name", "system_qty"],
+    "sales": ["store_id", "barcode", "sku_name", "sale_qty", "sale_date"],
+    "transfer": ["store_id_from", "store_id_to", "barcode", "sku_name", "transfer_qty", "transfer_date"],
+    "stocktake": ["store_id", "barcode", "sku_name", "actual_qty"],
 }
 
 NUMERIC_FIELDS = {
@@ -51,6 +51,27 @@ def validate_row(import_type, row, line_num):
             errors.append(f"第 {line_num} 行: 字段 '{field}' 的值 '{raw}' 不是有效数值")
 
     return errors
+
+
+def _defensive_check(import_type, line_num, row):
+    barcode = _normalize_val(row.get("barcode"))
+    if barcode is None:
+        return f"第 {line_num} 行: 商品标识 barcode 归一化后为空，拦截入库"
+
+    sku_name = _normalize_val(row.get("sku_name"))
+    if sku_name is None:
+        return f"第 {line_num} 行: 商品名称 sku_name 归一化后为空，拦截入库"
+
+    qty_fields = NUMERIC_FIELDS.get(import_type, [])
+    for qf in qty_fields:
+        raw = _normalize_val(row.get(qf))
+        if raw is None:
+            return f"第 {line_num} 行: 数量字段 '{qf}' 归一化后为空，拦截入库"
+        try:
+            float(raw)
+        except (ValueError, TypeError):
+            return f"第 {line_num} 行: 数量字段 '{qf}'='{raw}' 不是有效数值，拦截入库"
+    return None
 
 
 def import_csv(import_type, file_name, content_bytes):
@@ -114,7 +135,13 @@ def import_csv(import_type, file_name, content_bytes):
         )
         import_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
+        insert_count = 0
         for line_num, row in valid_rows:
+            defensive_err = _defensive_check(import_type, line_num, row)
+            if defensive_err:
+                all_errors.append(defensive_err)
+                continue
+
             raw_row = json.dumps(row, ensure_ascii=False)
             system_qty = _safe_float(row.get("system_qty"))
             actual_qty = _safe_float(row.get("actual_qty"))
@@ -145,12 +172,26 @@ def import_csv(import_type, file_name, content_bytes):
                     raw_row,
                 ),
             )
+            insert_count += 1
+
+        if insert_count == 0 and all_errors:
+            conn.execute("DELETE FROM import_records WHERE id = ?", (import_id,))
+            return {
+                "success": False,
+                "error": "所有行在入库前防御校验中均被拦截，无法导入",
+                "detail_errors": all_errors,
+            }
+
+        conn.execute(
+            "UPDATE import_records SET row_count = ?, error_count = ? WHERE id = ?",
+            (insert_count, len(all_errors), import_id),
+        )
 
         return {
             "success": True,
             "import_id": import_id,
             "total_rows": len(rows),
-            "valid_rows": len(valid_rows),
+            "valid_rows": insert_count,
             "error_rows": len(all_errors),
             "detail_errors": all_errors if all_errors else None,
         }

@@ -43,15 +43,19 @@ STOCKTAKE_ROWS = [
 BAD_ROWS_INVENTORY = [
     {"store_id": "S003", "barcode": "", "sku_name": "缺条码商品", "system_qty": 10},
     {"store_id": "S003", "barcode": "6901234567899", "sku_name": "缺数量商品", "system_qty": ""},
-    {"store_id": "S003", "barcode": "6901234567900", "sku_name": "正常商品", "system_qty": 15},
+    {"store_id": "S003", "barcode": "6901234567900", "sku_name": "", "system_qty": 15},
+    {"store_id": "S003", "barcode": "6901234567901", "sku_name": "   ", "system_qty": 20},
+    {"store_id": "S003", "barcode": "6901234567902", "sku_name": "库存正常商品", "system_qty": 25},
 ]
 
 BAD_ROWS_SALES = [
     {"store_id": "S003", "barcode": "", "sku_name": "销售缺条码", "sale_qty": 3, "sale_date": "2025-06-20"},
-    {"store_id": "S003", "barcode": "6901234567901", "sku_name": "销售缺数量", "sale_qty": "", "sale_date": "2025-06-20"},
-    {"store_id": "S003", "barcode": "6901234567902", "sku_name": "销售数量非数值", "sale_qty": "abc", "sale_date": "2025-06-20"},
-    {"store_id": "S003", "barcode": "6901234567903", "sku_name": "销售缺日期", "sale_qty": 5, "sale_date": ""},
-    {"store_id": "S003", "barcode": "6901234567904", "sku_name": "销售正常行", "sale_qty": 7, "sale_date": "2025-06-20"},
+    {"store_id": "S003", "barcode": "6901234567901", "sku_name": "", "sale_qty": 5, "sale_date": "2025-06-20"},
+    {"store_id": "S003", "barcode": "6901234567902", "sku_name": "   ", "sale_qty": 2, "sale_date": "2025-06-20"},
+    {"store_id": "S003", "barcode": "6901234567903", "sku_name": "销售缺数量", "sale_qty": "", "sale_date": "2025-06-20"},
+    {"store_id": "S003", "barcode": "6901234567904", "sku_name": "销售数量非数值", "sale_qty": "abc", "sale_date": "2025-06-20"},
+    {"store_id": "S003", "barcode": "6901234567905", "sku_name": "销售缺日期", "sale_qty": 5, "sale_date": ""},
+    {"store_id": "S003", "barcode": "6901234567906", "sku_name": "销售正常行", "sale_qty": 7, "sale_date": "2025-06-20"},
 ]
 
 

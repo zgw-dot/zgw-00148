@@ -338,6 +338,7 @@ def _migrate_db(conn):
         """)
 
     _migrate_work_orders(conn)
+    _migrate_handover_packages(conn)
 
 
 def now_iso():
@@ -2489,3 +2490,718 @@ def save_wo_batch_selection(conn, selected_ids):
 
 def load_wo_batch_selection(conn):
     return load_ui_state(conn, WO_BATCH_SELECT_KEY, default=[])
+
+
+HP_STATUS_PENDING_HANDOVER = "pending_handover"
+HP_STATUS_RECEIVED = "received"
+HP_STATUS_PROCESSING = "processing"
+HP_STATUS_COMPLETED = "completed"
+HP_STATUS_WITHDRAWN = "withdrawn"
+
+HP_STATUS_LABELS = {
+    HP_STATUS_PENDING_HANDOVER: "待交接",
+    HP_STATUS_RECEIVED: "已接收",
+    HP_STATUS_PROCESSING: "处理中",
+    HP_STATUS_COMPLETED: "已完成",
+    HP_STATUS_WITHDRAWN: "已撤回",
+}
+
+HP_VALID_TRANSITIONS = {
+    HP_STATUS_PENDING_HANDOVER: [HP_STATUS_RECEIVED, HP_STATUS_WITHDRAWN],
+    HP_STATUS_RECEIVED: [HP_STATUS_PROCESSING],
+    HP_STATUS_PROCESSING: [HP_STATUS_COMPLETED],
+    HP_STATUS_COMPLETED: [],
+    HP_STATUS_WITHDRAWN: [],
+}
+
+HP_ROLE_ADMIN = "admin"
+HP_ROLE_NORMAL = "normal"
+
+HP_ACTION_LABELS = {
+    "create": "建包",
+    "receive": "接收",
+    "withdraw": "撤回",
+    "status_change": "状态变更",
+    "export": "导出",
+    "import_preview": "导回预检",
+    "import_confirm": "导回确认",
+}
+
+
+def _migrate_handover_packages(conn):
+    hp_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='handover_packages'"
+    ).fetchone()
+    if not hp_exists:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS handover_packages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pkg_no TEXT NOT NULL UNIQUE,
+                title TEXT NOT NULL,
+                description TEXT,
+                receiver TEXT,
+                handover_note TEXT,
+                status TEXT NOT NULL DEFAULT 'pending_handover',
+                filter_snapshot TEXT,
+                selected_ids_json TEXT,
+                created_by TEXT NOT NULL DEFAULT 'user',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                received_at TEXT,
+                received_by TEXT,
+                completed_at TEXT,
+                withdrawn_at TEXT
+            )
+        """)
+
+    hpi_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='handover_package_items'"
+    ).fetchone()
+    if not hpi_exists:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS handover_package_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                package_id INTEGER NOT NULL,
+                discrepancy_id INTEGER NOT NULL,
+                store_id TEXT NOT NULL,
+                barcode TEXT NOT NULL,
+                sku_name TEXT,
+                diff_qty REAL NOT NULL,
+                attributed_cause TEXT,
+                review_note TEXT,
+                evidence_snapshot TEXT,
+                disc_status TEXT,
+                disc_updated_at TEXT,
+                FOREIGN KEY (package_id) REFERENCES handover_packages(id),
+                FOREIGN KEY (discrepancy_id) REFERENCES discrepancies(id)
+            )
+        """)
+
+    hpl_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='handover_package_logs'"
+    ).fetchone()
+    if not hpl_exists:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS handover_package_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                package_id INTEGER NOT NULL DEFAULT 0,
+                action_type TEXT NOT NULL,
+                action_detail TEXT,
+                operator TEXT NOT NULL DEFAULT 'user',
+                operated_at TEXT NOT NULL
+            )
+        """)
+
+
+def _generate_pkg_no(conn):
+    now = datetime.now()
+    date_str = now.strftime("%Y%m%d")
+    prefix = f"HP{date_str}"
+    row = conn.execute(
+        "SELECT pkg_no FROM handover_packages WHERE pkg_no LIKE ? ORDER BY id DESC LIMIT 1",
+        (f"{prefix}%",)
+    ).fetchone()
+    if row:
+        last_no = row["pkg_no"]
+        seq = int(last_no[-4:]) + 1
+    else:
+        seq = 1
+    return f"{prefix}{seq:04d}"
+
+
+def _log_handover_action(conn, package_id, action_type, action_detail=None,
+                         operator="user"):
+    now = now_iso()
+    conn.execute(
+        """INSERT INTO handover_package_logs
+           (package_id, action_type, action_detail, operator, operated_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (package_id, action_type, action_detail, operator, now),
+    )
+
+
+def create_handover_package(conn, title, discrepancy_ids, receiver=None,
+                            handover_note=None, description=None,
+                            filter_snapshot=None, created_by="user"):
+    if not discrepancy_ids:
+        return {"success": False, "error": "请至少选择一条差异记录"}
+
+    pkg_no = _generate_pkg_no(conn)
+    now = now_iso()
+
+    selected_ids_json = json.dumps(discrepancy_ids, ensure_ascii=False)
+    filter_json = json.dumps(filter_snapshot, ensure_ascii=False) if filter_snapshot else None
+
+    conn.execute(
+        """INSERT INTO handover_packages
+           (pkg_no, title, description, receiver, handover_note, status,
+            filter_snapshot, selected_ids_json, created_by, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, 'pending_handover', ?, ?, ?, ?, ?)""",
+        (pkg_no, title, description, receiver, handover_note,
+         filter_json, selected_ids_json, created_by, now, now),
+    )
+    row = conn.execute("SELECT * FROM handover_packages WHERE pkg_no = ?", (pkg_no,)).fetchone()
+    pkg_id = row["id"]
+
+    for disc_id in discrepancy_ids:
+        disc = conn.execute("SELECT * FROM discrepancies WHERE id = ?", (disc_id,)).fetchone()
+        if not disc:
+            continue
+        disc = dict(disc)
+
+        evidence = get_evidence_for_discrepancy(conn, disc_id)
+        evidence_json = json.dumps(evidence, ensure_ascii=False, default=str)
+
+        conn.execute(
+            """INSERT INTO handover_package_items
+               (package_id, discrepancy_id, store_id, barcode, sku_name, diff_qty,
+                attributed_cause, review_note, evidence_snapshot, disc_status, disc_updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (pkg_id, disc_id, disc["store_id"], disc["barcode"],
+             disc.get("sku_name"), disc["diff_qty"], disc.get("attributed_cause"),
+             disc.get("review_note"), evidence_json, disc["status"], disc["updated_at"]),
+        )
+
+    _log_handover_action(conn, pkg_id, "create",
+                         f"创建交接包，包含 {len(discrepancy_ids)} 条差异", created_by)
+
+    return {"success": True, "package_id": pkg_id, "pkg_no": pkg_no}
+
+
+def get_handover_package(conn, pkg_id):
+    row = conn.execute(
+        "SELECT * FROM handover_packages WHERE id = ?", (pkg_id,)
+    ).fetchone()
+    if not row:
+        return None
+    pkg = dict(row)
+    items = conn.execute(
+        "SELECT * FROM handover_package_items WHERE package_id = ?", (pkg_id,)
+    ).fetchall()
+    pkg["items"] = [dict(it) for it in items]
+    return pkg
+
+
+def get_handover_package_by_no(conn, pkg_no):
+    row = conn.execute(
+        "SELECT * FROM handover_packages WHERE pkg_no = ?", (pkg_no,)
+    ).fetchone()
+    if not row:
+        return None
+    return dict(row)
+
+
+def list_handover_packages(conn, store_id=None, status=None, receiver=None,
+                           keyword=None):
+    sql = "SELECT * FROM handover_packages WHERE 1=1"
+    params = []
+    if status:
+        sql += " AND status = ?"
+        params.append(status)
+    if receiver:
+        sql += " AND receiver = ?"
+        params.append(receiver)
+    if keyword:
+        sql += " AND (pkg_no LIKE ? OR title LIKE ? OR receiver LIKE ?)"
+        kw = f"%{keyword}%"
+        params.extend([kw, kw, kw])
+    sql += " ORDER BY created_at DESC"
+    rows = conn.execute(sql, params).fetchall()
+    packages = [dict(r) for r in rows]
+
+    if store_id:
+        filtered = []
+        for pkg in packages:
+            items = conn.execute(
+                "SELECT id FROM handover_package_items WHERE package_id = ? AND store_id = ? LIMIT 1",
+                (pkg["id"], store_id)
+            ).fetchone()
+            if items:
+                filtered.append(pkg)
+        packages = filtered
+
+    return packages
+
+
+def get_handover_package_items(conn, pkg_id):
+    rows = conn.execute(
+        "SELECT * FROM handover_package_items WHERE package_id = ?", (pkg_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def transition_handover_status(conn, pkg_id, to_status, operator="user",
+                               role=HP_ROLE_ADMIN, note=None):
+    pkg = get_handover_package(conn, pkg_id)
+    if not pkg:
+        return {"success": False, "error": f"交接包不存在: {pkg_id}"}
+
+    from_status = pkg["status"]
+
+    if from_status == HP_STATUS_COMPLETED:
+        return {"success": False, "error": "已完成的交接包不允许再变更状态"}
+
+    if from_status == HP_STATUS_WITHDRAWN:
+        return {"success": False, "error": "已撤回的交接包不允许再变更状态"}
+
+    if to_status not in HP_VALID_TRANSITIONS.get(from_status, []):
+        return {
+            "success": False,
+            "error": f"不允许从 '{HP_STATUS_LABELS.get(from_status, from_status)}' "
+                     f"转换到 '{HP_STATUS_LABELS.get(to_status, to_status)}'"
+        }
+
+    if to_status == HP_STATUS_WITHDRAWN:
+        if role != HP_ROLE_ADMIN and pkg["created_by"] != operator:
+            return {
+                "success": False,
+                "error": "普通角色只能撤回自己创建的交接包",
+            }
+
+    if to_status == HP_STATUS_RECEIVED:
+        if role != HP_ROLE_ADMIN and pkg.get("receiver") and pkg["receiver"] != operator:
+            return {
+                "success": False,
+                "error": f"该交接包指定接手人为 '{pkg['receiver']}'，您无权接收",
+            }
+
+    now = now_iso()
+    updates = {"status": to_status, "updated_at": now}
+    if to_status == HP_STATUS_RECEIVED:
+        updates["received_at"] = now
+        updates["received_by"] = operator
+    elif to_status == HP_STATUS_COMPLETED:
+        updates["completed_at"] = now
+    elif to_status == HP_STATUS_WITHDRAWN:
+        updates["withdrawn_at"] = now
+
+    set_clause = ", ".join(f"{k} = ?" for k in updates.keys())
+    params = list(updates.values())
+    params.append(pkg_id)
+
+    conn.execute(
+        f"UPDATE handover_packages SET {set_clause} WHERE id = ?",
+        params
+    )
+
+    detail = f"状态变更: {HP_STATUS_LABELS.get(from_status, from_status)} → {HP_STATUS_LABELS.get(to_status, to_status)}"
+    if note:
+        detail += f"，备注: {note}"
+    action_type = "status_change"
+    if to_status == HP_STATUS_RECEIVED:
+        action_type = "receive"
+    elif to_status == HP_STATUS_WITHDRAWN:
+        action_type = "withdraw"
+    _log_handover_action(conn, pkg_id, action_type, detail, operator)
+
+    return {"success": True, "from_status": from_status, "to_status": to_status}
+
+
+def update_handover_package(conn, pkg_id, updates, operator="user", role=HP_ROLE_ADMIN):
+    pkg = get_handover_package(conn, pkg_id)
+    if not pkg:
+        return {"success": False, "error": f"交接包不存在: {pkg_id}"}
+
+    if pkg["status"] == HP_STATUS_COMPLETED:
+        return {"success": False, "error": "已完成的交接包不允许再编辑"}
+
+    if pkg["status"] == HP_STATUS_WITHDRAWN:
+        return {"success": False, "error": "已撤回的交接包不允许再编辑"}
+
+    if pkg["status"] == HP_STATUS_RECEIVED:
+        if role != HP_ROLE_ADMIN and pkg.get("received_by") and pkg["received_by"] != operator:
+            return {"success": False, "error": "普通角色不能编辑别人已接收的交接包"}
+
+    allowed_fields = ["title", "description", "receiver", "handover_note"]
+    update_dict = {k: v for k, v in updates.items() if k in allowed_fields and v is not None}
+
+    if not update_dict:
+        return {"success": False, "error": "没有有效的更新字段"}
+
+    set_clause = ", ".join(f"{k} = ?" for k in update_dict.keys())
+    params = list(update_dict.values())
+    params.extend([now_iso(), pkg_id])
+
+    conn.execute(
+        f"UPDATE handover_packages SET {set_clause}, updated_at = ? WHERE id = ?",
+        params
+    )
+
+    detail = "更新字段: " + ", ".join(update_dict.keys())
+    _log_handover_action(conn, pkg_id, "update", detail, operator)
+
+    return {"success": True}
+
+
+def get_handover_package_logs(conn, pkg_id, limit=100):
+    rows = conn.execute(
+        "SELECT * FROM handover_package_logs WHERE package_id = ? ORDER BY operated_at DESC LIMIT ?",
+        (pkg_id, limit)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_all_handover_logs(conn, operator=None, action_type=None, limit=200):
+    sql = "SELECT l.*, hp.pkg_no FROM handover_package_logs l LEFT JOIN handover_packages hp ON l.package_id = hp.id WHERE 1=1"
+    params = []
+    if operator:
+        sql += " AND l.operator = ?"
+        params.append(operator)
+    if action_type:
+        sql += " AND l.action_type = ?"
+        params.append(action_type)
+    sql += " ORDER BY l.operated_at DESC LIMIT ?"
+    params.append(limit)
+    rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_hp_stores(conn):
+    rows = conn.execute(
+        "SELECT DISTINCT store_id FROM handover_package_items ORDER BY store_id"
+    ).fetchall()
+    return [r["store_id"] for r in rows if r["store_id"]]
+
+
+def get_hp_receivers(conn):
+    rows = conn.execute(
+        "SELECT DISTINCT receiver FROM handover_packages WHERE receiver IS NOT NULL ORDER BY receiver"
+    ).fetchall()
+    return [r["receiver"] for r in rows if r["receiver"]]
+
+
+def export_handover_packages_json(conn, store_id=None, status=None, receiver=None):
+    packages = list_handover_packages(conn, store_id=store_id, status=status, receiver=receiver)
+    for pkg in packages:
+        items = get_handover_package_items(conn, pkg["id"])
+        pkg["items"] = items
+        logs = get_handover_package_logs(conn, pkg["id"])
+        pkg["logs"] = logs
+    now = now_iso()
+    detail = f"导出交接包: 共 {len(packages)} 个"
+    conn.execute(
+        """INSERT INTO handover_package_logs
+           (package_id, action_type, action_detail, operator, operated_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (0, "export", detail, "system", now),
+    )
+    return {
+        "export_version": "1.0",
+        "export_type": "handover_packages",
+        "exported_at": now,
+        "filter": {
+            "store_id": store_id,
+            "status": status,
+            "receiver": receiver,
+        },
+        "total": len(packages),
+        "handover_packages": packages,
+    }
+
+
+def preview_handover_packages_import(conn, import_data):
+    if not isinstance(import_data, dict):
+        return {"success": False, "error": "导入数据格式错误"}
+
+    if import_data.get("export_type") != "handover_packages":
+        return {"success": False, "error": "不是交接包导出文件"}
+
+    packages = import_data.get("handover_packages", [])
+    if not packages:
+        return {"success": False, "error": "导入数据中没有交接包记录"}
+
+    results = []
+    for pkg in packages:
+        pkg_no = pkg.get("pkg_no")
+        existing = get_handover_package_by_no(conn, pkg_no) if pkg_no else None
+
+        if not existing:
+            results.append({
+                "pkg_no": pkg_no,
+                "title": pkg.get("title"),
+                "import_status": "new",
+                "conflicts": [],
+                "reason": "新建",
+            })
+            continue
+
+        conflicts = []
+
+        if existing["status"] == HP_STATUS_COMPLETED:
+            conflicts.append({
+                "type": "already_completed",
+                "message": f"本地已为「已完成」状态，不允许覆盖",
+            })
+
+        if existing["status"] == HP_STATUS_WITHDRAWN:
+            conflicts.append({
+                "type": "already_withdrawn",
+                "message": f"本地已为「已撤回」状态，不允许覆盖",
+            })
+
+        import_items = pkg.get("items", [])
+        for imp_item in import_items:
+            disc_id = imp_item.get("discrepancy_id")
+            if not disc_id:
+                continue
+            local_disc = conn.execute(
+                "SELECT * FROM discrepancies WHERE id = ?", (disc_id,)
+            ).fetchone()
+            if not local_disc:
+                conflicts.append({
+                    "type": "discrepancy_missing",
+                    "message": f"差异记录 {disc_id} 在本地不存在",
+                    "discrepancy_id": disc_id,
+                })
+                continue
+
+            local_disc = dict(local_disc)
+            snap_updated = imp_item.get("disc_updated_at")
+            if snap_updated and local_disc["updated_at"] > snap_updated:
+                conflicts.append({
+                    "type": "local_newer",
+                    "message": f"差异 {disc_id} 本地状态更晚（本地: {local_disc['updated_at'][:19]}，快照: {snap_updated[:19]}）",
+                    "discrepancy_id": disc_id,
+                })
+
+            snap_note = imp_item.get("review_note")
+            if snap_note and local_disc.get("review_note") and snap_note != local_disc["review_note"]:
+                conflicts.append({
+                    "type": "note_changed",
+                    "message": f"差异 {disc_id} 复核备注已被修改",
+                    "discrepancy_id": disc_id,
+                })
+
+            snap_status = imp_item.get("disc_status")
+            if snap_status and local_disc["status"] != snap_status:
+                conflicts.append({
+                    "type": "status_changed",
+                    "message": f"差异 {disc_id} 状态不一致（本地: {HP_STATUS_LABELS.get(local_disc['status'], local_disc['status'])}，快照: {HP_STATUS_LABELS.get(snap_status, snap_status)}）",
+                    "discrepancy_id": disc_id,
+                })
+
+        if existing.get("received_by") and existing["received_by"] != pkg.get("received_by"):
+            conflicts.append({
+                "type": "responsible_changed",
+                "message": f"接手人不同（本地: {existing['received_by']}，导入: {pkg.get('received_by', '无')}）",
+            })
+
+        if conflicts:
+            results.append({
+                "pkg_no": pkg_no,
+                "title": pkg.get("title"),
+                "import_status": "conflict",
+                "conflicts": conflicts,
+                "reason": f"存在 {len(conflicts)} 个冲突",
+            })
+        else:
+            results.append({
+                "pkg_no": pkg_no,
+                "title": pkg.get("title"),
+                "import_status": "safe",
+                "conflicts": [],
+                "reason": "可安全接收",
+            })
+
+    return {
+        "success": True,
+        "total": len(results),
+        "new_count": sum(1 for r in results if r["import_status"] == "new"),
+        "safe_count": sum(1 for r in results if r["import_status"] == "safe"),
+        "conflict_count": sum(1 for r in results if r["import_status"] == "conflict"),
+        "preview_results": results,
+        "import_data": import_data,
+    }
+
+
+def confirm_handover_packages_import(conn, preview_results, import_data, operator="user"):
+    packages = import_data.get("handover_packages", [])
+    pkg_map = {p.get("pkg_no"): p for p in packages}
+
+    created_count = 0
+    received_count = 0
+    skipped_count = 0
+    failed_count = 0
+    results = []
+
+    for item in preview_results:
+        pkg_no = item["pkg_no"]
+        imp_status = item["import_status"]
+
+        if imp_status == "conflict":
+            results.append({
+                "pkg_no": pkg_no,
+                "action": "skipped",
+                "reason": "存在冲突，请手动处理",
+            })
+            skipped_count += 1
+            continue
+
+        pkg_data = pkg_map.get(pkg_no)
+        if not pkg_data:
+            results.append({
+                "pkg_no": pkg_no,
+                "action": "skipped",
+                "reason": "导入数据中找不到该包",
+            })
+            skipped_count += 1
+            continue
+
+        if imp_status == "new":
+            disc_ids = [it.get("discrepancy_id") for it in pkg_data.get("items", []) if it.get("discrepancy_id")]
+            filter_snap = pkg_data.get("filter_snapshot")
+            if isinstance(filter_snap, str):
+                try:
+                    filter_snap = json.loads(filter_snap)
+                except (TypeError, json.JSONDecodeError):
+                    filter_snap = None
+
+            r = create_handover_package(
+                conn,
+                title=pkg_data.get("title", pkg_no),
+                discrepancy_ids=disc_ids,
+                receiver=pkg_data.get("receiver"),
+                handover_note=pkg_data.get("handover_note"),
+                description=pkg_data.get("description"),
+                filter_snapshot=filter_snap,
+                created_by=pkg_data.get("created_by", operator),
+            )
+            if r["success"]:
+                created_count += 1
+                results.append({"pkg_no": pkg_no, "action": "created", "new_pkg_no": r["pkg_no"]})
+            else:
+                failed_count += 1
+                results.append({"pkg_no": pkg_no, "action": "failed", "reason": r.get("error", "创建失败")})
+            continue
+
+        if imp_status == "safe":
+            existing = get_handover_package_by_no(conn, pkg_no)
+            if not existing:
+                results.append({"pkg_no": pkg_no, "action": "skipped", "reason": "本地不存在该包"})
+                skipped_count += 1
+                continue
+
+            target_status = pkg_data.get("status")
+            if target_status and target_status != existing["status"]:
+                r = transition_handover_status(
+                    conn, existing["id"], target_status,
+                    operator=operator, role=HP_ROLE_ADMIN,
+                    note=f"导回确认状态变更",
+                )
+                if r["success"]:
+                    received_count += 1
+                    results.append({
+                        "pkg_no": pkg_no,
+                        "action": "updated",
+                        "from_status": r["from_status"],
+                        "to_status": r["to_status"],
+                    })
+                else:
+                    failed_count += 1
+                    results.append({"pkg_no": pkg_no, "action": "failed", "reason": r.get("error", "更新失败")})
+            else:
+                results.append({"pkg_no": pkg_no, "action": "skipped", "reason": "状态一致，跳过"})
+                skipped_count += 1
+
+    _log_handover_action_import_summary(conn, operator, created_count, received_count,
+                                        skipped_count, failed_count)
+
+    return {
+        "success": True,
+        "total": len(results),
+        "created_count": created_count,
+        "received_count": received_count,
+        "skipped_count": skipped_count,
+        "failed_count": failed_count,
+        "results": results,
+    }
+
+
+def _log_handover_action_import_summary(conn, operator, created, received, skipped, failed):
+    now = now_iso()
+    detail = f"导回结果: 新建 {created}, 接收 {received}, 跳过 {skipped}, 失败 {failed}"
+    conn.execute(
+        """INSERT INTO handover_package_logs
+           (package_id, action_type, action_detail, operator, operated_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (0, "import_confirm", detail, operator, now),
+    )
+
+
+HP_UI_STATE_KEY = "handover_ui_state"
+HP_DRAFT_KEY = "handover_draft"
+HP_BATCH_SELECT_KEY = "handover_batch_selection"
+
+
+def save_hp_ui_state(conn, state):
+    save_ui_state(conn, HP_UI_STATE_KEY, state)
+
+
+def load_hp_ui_state(conn):
+    return load_ui_state(conn, HP_UI_STATE_KEY, default={})
+
+
+def save_hp_draft(conn, draft_data):
+    save_ui_state(conn, HP_DRAFT_KEY, draft_data)
+
+
+def load_hp_draft(conn):
+    return load_ui_state(conn, HP_DRAFT_KEY, default=None)
+
+
+def clear_hp_draft(conn):
+    save_ui_state(conn, HP_DRAFT_KEY, None)
+
+
+def save_hp_batch_selection(conn, selected_ids):
+    save_ui_state(conn, HP_BATCH_SELECT_KEY, selected_ids)
+
+
+def load_hp_batch_selection(conn):
+    return load_ui_state(conn, HP_BATCH_SELECT_KEY, default=[])
+
+
+def generate_handover_sample_data(conn):
+    existing = list_handover_packages(conn)
+    if existing:
+        return
+
+    discs = get_discrepancies(conn, status=STATUS_PENDING_REVIEW)
+    if len(discs) < 2:
+        discs = get_discrepancies(conn)
+    if len(discs) < 2:
+        return
+
+    sample_ids = [d["id"] for d in discs[:3]]
+
+    filter_snap = {
+        "store_id": discs[0]["store_id"] if discs else None,
+        "status": STATUS_PENDING_REVIEW,
+    }
+
+    r = create_handover_package(
+        conn,
+        title="早班遗留差异交接",
+        discrepancy_ids=sample_ids[:2],
+        receiver="night_shift_user",
+        handover_note="早班未处理完的差异，请夜班继续跟进",
+        description="早班遗留待复核差异",
+        filter_snapshot=filter_snap,
+        created_by="morning_shift_user",
+    )
+    if r["success"]:
+        transition_handover_status(
+            conn, r["package_id"], HP_STATUS_RECEIVED,
+            operator="night_shift_user", role=HP_ROLE_ADMIN,
+        )
+
+    if len(sample_ids) >= 3:
+        create_handover_package(
+            conn,
+            title="门店S001异常盘点交接",
+            discrepancy_ids=[sample_ids[2]],
+            receiver="day_shift_user",
+            handover_note="需要日班确认处理",
+            filter_snapshot={"store_id": "S001"},
+            created_by="morning_shift_user",
+        )

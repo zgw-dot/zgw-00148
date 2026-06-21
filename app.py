@@ -44,6 +44,21 @@ from db import (
     save_wo_ui_state, load_wo_ui_state,
     save_wo_draft, load_wo_draft, clear_wo_draft,
     save_wo_batch_selection, load_wo_batch_selection,
+    HP_STATUS_PENDING_HANDOVER, HP_STATUS_RECEIVED, HP_STATUS_PROCESSING,
+    HP_STATUS_COMPLETED, HP_STATUS_WITHDRAWN,
+    HP_STATUS_LABELS, HP_VALID_TRANSITIONS, HP_ROLE_ADMIN, HP_ROLE_NORMAL,
+    HP_ACTION_LABELS,
+    create_handover_package, get_handover_package, get_handover_package_by_no,
+    list_handover_packages, get_handover_package_items,
+    transition_handover_status, update_handover_package,
+    get_handover_package_logs, get_all_handover_logs,
+    get_hp_stores, get_hp_receivers,
+    export_handover_packages_json, preview_handover_packages_import,
+    confirm_handover_packages_import,
+    save_hp_ui_state, load_hp_ui_state,
+    save_hp_draft, load_hp_draft, clear_hp_draft,
+    save_hp_batch_selection, load_hp_batch_selection,
+    generate_handover_sample_data,
 )
 from import_service import import_csv
 from engine import run_attribution, CAUSE_LABELS
@@ -56,6 +71,8 @@ init_db()
 
 if "sample_generated" not in st.session_state:
     generate_sample_data()
+    with get_conn() as conn:
+        generate_handover_sample_data(conn)
     st.session_state.sample_generated = True
 
 
@@ -71,10 +88,23 @@ def _status_badge(status):
     return f'<span style="background:{color};color:white;padding:2px 10px;border-radius:10px;font-size:13px">{label}</span>'
 
 
+def _hp_status_badge(status):
+    colors = {
+        HP_STATUS_PENDING_HANDOVER: "#FFA500",
+        HP_STATUS_RECEIVED: "#4169E1",
+        HP_STATUS_PROCESSING: "#9370DB",
+        HP_STATUS_COMPLETED: "#2E8B57",
+        HP_STATUS_WITHDRAWN: "#888888",
+    }
+    label = HP_STATUS_LABELS.get(status, status)
+    color = colors.get(status, "#888")
+    return f'<span style="background:{color};color:white;padding:2px 10px;border-radius:10px;font-size:13px">{label}</span>'
+
+
 st.title("📦 门店盘点差异复盘工具")
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-    "📥 数据导入", "🔍 差异归因", "📋 差异列表", "⚙️ 规则配置", "📤 导出", "📊 差异复盘对比", "📝 差异处置工单台账",
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+    "📥 数据导入", "🔍 差异归因", "📋 差异列表", "⚙️ 规则配置", "📤 导出", "📊 差异复盘对比", "📝 差异处置工单台账", "📦 复盘交接包",
 ])
 
 # ── Tab 1: 数据导入 ──
@@ -2899,4 +2929,751 @@ with tab7:
             else:
                 st.session_state.wo_user_role = WO_ROLE_ADMIN
                 st.session_state.wo_current_user = "admin_user"
+            st.rerun()
+
+# ── Tab 8: 复盘交接包 ──
+with tab8:
+    st.header("📦 复盘交接包")
+
+    with get_conn() as conn:
+        saved_hp_ui = load_hp_ui_state(conn)
+        saved_hp_batch = load_hp_batch_selection(conn)
+        saved_hp_draft = load_hp_draft(conn)
+
+    if "hp_current_user" not in st.session_state:
+        st.session_state.hp_current_user = "admin_user"
+    if "hp_user_role" not in st.session_state:
+        st.session_state.hp_user_role = HP_ROLE_ADMIN
+    if "hp_selected_ids" not in st.session_state:
+        st.session_state.hp_selected_ids = list(saved_hp_batch) if saved_hp_batch else []
+    if "hp_view" not in st.session_state:
+        st.session_state.hp_view = "list"
+    if "hp_detail_id" not in st.session_state:
+        st.session_state.hp_detail_id = None
+    if "hp_create_selected" not in st.session_state:
+        st.session_state.hp_create_selected = list(saved_hp_draft.get("selected_ids", [])) if saved_hp_draft else []
+    if "hp_import_preview" not in st.session_state:
+        st.session_state.hp_import_preview = None
+    if "hp_filter_store" not in st.session_state:
+        st.session_state.hp_filter_store = saved_hp_ui.get("filter_store", "全部")
+    if "hp_filter_status" not in st.session_state:
+        st.session_state.hp_filter_status = saved_hp_ui.get("filter_status", "全部")
+    if "hp_filter_receiver" not in st.session_state:
+        st.session_state.hp_filter_receiver = saved_hp_ui.get("filter_receiver", "全部")
+
+    hp_subtab1, hp_subtab2, hp_subtab3, hp_subtab4, hp_subtab5 = st.tabs([
+        "📋 交接包列表", "➕ 新建交接包", "📤 导出 / 📥 导回", "📜 操作日志", "🔄 恢复视角",
+    ])
+
+    with hp_subtab1:
+        st.subheader("交接包列表")
+
+        with get_conn() as conn:
+            hp_stores = get_hp_stores(conn)
+            hp_receivers = get_hp_receivers(conn)
+
+        all_stores_list = ["全部"] + hp_stores
+        all_status_list = ["全部"] + list(HP_STATUS_LABELS.keys())
+        all_receivers_list = ["全部"] + hp_receivers
+
+        col_hf1, col_hf2, col_hf3, col_hf4 = st.columns(4)
+        with col_hf1:
+            filter_hp_store = st.selectbox(
+                "按门店筛选",
+                all_stores_list,
+                index=all_stores_list.index(st.session_state.hp_filter_store)
+                if st.session_state.hp_filter_store in all_stores_list else 0,
+                key="hp_filter_store_sel",
+            )
+        with col_hf2:
+            filter_hp_status = st.selectbox(
+                "按状态筛选",
+                all_status_list,
+                format_func=lambda x: "全部" if x == "全部" else HP_STATUS_LABELS.get(x, x),
+                index=all_status_list.index(st.session_state.hp_filter_status)
+                if st.session_state.hp_filter_status in all_status_list else 0,
+                key="hp_filter_status_sel",
+            )
+        with col_hf3:
+            filter_hp_receiver = st.selectbox(
+                "按接手人筛选",
+                all_receivers_list,
+                index=all_receivers_list.index(st.session_state.hp_filter_receiver)
+                if st.session_state.hp_filter_receiver in all_receivers_list else 0,
+                key="hp_filter_receiver_sel",
+            )
+        with col_hf4:
+            filter_hp_keyword = st.text_input(
+                "关键词搜索",
+                value=saved_hp_ui.get("keyword", ""),
+                placeholder="包号/标题/接手人",
+                key="hp_filter_keyword",
+            )
+
+        st.session_state.hp_filter_store = filter_hp_store
+        st.session_state.hp_filter_status = filter_hp_status
+        st.session_state.hp_filter_receiver = filter_hp_receiver
+
+        with get_conn() as conn:
+            save_hp_ui_state(conn, {
+                "filter_store": filter_hp_store,
+                "filter_status": filter_hp_status,
+                "filter_receiver": filter_hp_receiver,
+                "keyword": filter_hp_keyword,
+            })
+
+        store_param = None if filter_hp_store == "全部" else filter_hp_store
+        status_param = None if filter_hp_status == "全部" else filter_hp_status
+        receiver_param = None if filter_hp_receiver == "全部" else filter_hp_receiver
+        kw_param = filter_hp_keyword if filter_hp_keyword else None
+
+        with get_conn() as conn:
+            hp_list = list_handover_packages(
+                conn, store_id=store_param, status=status_param,
+                receiver=receiver_param, keyword=kw_param,
+            )
+
+        if st.session_state.hp_view == "detail" and st.session_state.hp_detail_id:
+            with get_conn() as conn:
+                hp_detail = get_handover_package(conn, st.session_state.hp_detail_id)
+                hp_logs = get_handover_package_logs(conn, st.session_state.hp_detail_id)
+
+            if hp_detail:
+                col_back, col_title = st.columns([1, 10])
+                with col_back:
+                    if st.button("↩️ 返回列表", key="hp_back_to_list"):
+                        st.session_state.hp_view = "list"
+                        st.session_state.hp_detail_id = None
+                        st.rerun()
+                with col_title:
+                    st.subheader(f"交接包详情 - {hp_detail['pkg_no']}")
+                    st.markdown(_hp_status_badge(hp_detail["status"]), unsafe_allow_html=True)
+
+                col_d1, col_d2 = st.columns(2)
+                with col_d1:
+                    st.markdown(f"**标题**: {hp_detail['title']}")
+                    st.markdown(f"**描述**: {hp_detail.get('description') or '无'}")
+                    st.markdown(f"**接手人**: {hp_detail.get('receiver') or '未指定'}")
+                    st.markdown(f"**创建人**: {hp_detail.get('created_by', 'user')}")
+                with col_d2:
+                    st.markdown(f"**交接说明**: {hp_detail.get('handover_note') or '无'}")
+                    st.markdown(f"**创建时间**: {hp_detail['created_at'][:19]}")
+                    if hp_detail.get("received_at"):
+                        st.markdown(f"**接收时间**: {hp_detail['received_at'][:19]}")
+                        st.markdown(f"**接收人**: {hp_detail.get('received_by', '-')}")
+                    if hp_detail.get("completed_at"):
+                        st.markdown(f"**完成时间**: {hp_detail['completed_at'][:19]}")
+                    if hp_detail.get("withdrawn_at"):
+                        st.markdown(f"**撤回时间**: {hp_detail['withdrawn_at'][:19]}")
+
+                st.divider()
+                st.markdown("### 📋 包内差异条目")
+                items = hp_detail.get("items", [])
+                if items:
+                    for it in items:
+                        cause_label = CAUSE_LABELS.get(it.get("attributed_cause"), it.get("attributed_cause") or "未归因")
+                        disc_status_label = STATUS_LABELS.get(it.get("disc_status"), it.get("disc_status") or "未知")
+                        with st.expander(f"**{it['store_id']}** / {it.get('sku_name') or it['barcode']} / 差异: {it['diff_qty']:+.1f}"):
+                            col_it1, col_it2 = st.columns(2)
+                            with col_it1:
+                                st.markdown(f"**门店**: {it['store_id']}")
+                                st.markdown(f"**条码**: {it['barcode']}")
+                                st.markdown(f"**差异数量**: {it['diff_qty']:+.1f}")
+                                st.markdown(f"**归因**: {cause_label}")
+                            with col_it2:
+                                st.markdown(f"**差异状态(快照)**: {disc_status_label}")
+                                st.markdown(f"**复核备注(快照)**: {it.get('review_note') or '无'}")
+                                st.markdown(f"**差异更新时间(快照)**: {(it.get('disc_updated_at') or '-')[:19]}")
+                                if it.get("evidence_snapshot"):
+                                    try:
+                                        ev = json.loads(it["evidence_snapshot"]) if isinstance(it["evidence_snapshot"], str) else it["evidence_snapshot"]
+                                        if ev:
+                                            with st.expander("🔍 证据快照"):
+                                                for e in ev[:5]:
+                                                    st.markdown(f"- [{e.get('evidence_type', '?')}] {e.get('description', '')}")
+                                    except (json.JSONDecodeError, TypeError):
+                                        pass
+                else:
+                    st.info("暂无差异条目")
+
+                st.divider()
+                st.markdown("### 📝 编辑交接包")
+                is_hp_editable = hp_detail["status"] not in (HP_STATUS_COMPLETED, HP_STATUS_WITHDRAWN)
+                if not is_hp_editable:
+                    st.warning(f"⚠️ 当前交接包状态为「{HP_STATUS_LABELS.get(hp_detail['status'], hp_detail['status'])}」，不允许编辑")
+
+                if hp_detail["status"] == HP_STATUS_RECEIVED:
+                    if st.session_state.hp_user_role != HP_ROLE_ADMIN and hp_detail.get("received_by") and hp_detail["received_by"] != st.session_state.hp_current_user:
+                        st.warning("⚠️ 普通角色不能编辑别人已接收的交接包")
+                        is_hp_editable = False
+
+                col_e1, col_e2 = st.columns(2)
+                with col_e1:
+                    edit_hp_title = st.text_input(
+                        "标题", value=hp_detail.get("title") or "",
+                        disabled=not is_hp_editable, key="edit_hp_title",
+                    )
+                    edit_hp_receiver = st.text_input(
+                        "接手人", value=hp_detail.get("receiver") or "",
+                        disabled=not is_hp_editable, key="edit_hp_receiver",
+                    )
+                with col_e2:
+                    edit_hp_desc = st.text_area(
+                        "描述", value=hp_detail.get("description") or "",
+                        disabled=not is_hp_editable, key="edit_hp_desc",
+                        height=80,
+                    )
+                    edit_hp_note = st.text_area(
+                        "交接说明", value=hp_detail.get("handover_note") or "",
+                        disabled=not is_hp_editable, key="edit_hp_note",
+                        height=80,
+                    )
+
+                if is_hp_editable and st.button("💾 保存修改", type="primary", key="hp_save_edit"):
+                    updates = {}
+                    if edit_hp_title.strip() != (hp_detail.get("title") or ""):
+                        updates["title"] = edit_hp_title.strip()
+                    if edit_hp_receiver.strip() != (hp_detail.get("receiver") or ""):
+                        updates["receiver"] = edit_hp_receiver.strip() or None
+                    if edit_hp_desc.strip() != (hp_detail.get("description") or ""):
+                        updates["description"] = edit_hp_desc.strip() or None
+                    if edit_hp_note.strip() != (hp_detail.get("handover_note") or ""):
+                        updates["handover_note"] = edit_hp_note.strip() or None
+
+                    if updates:
+                        with get_conn() as conn:
+                            r = update_handover_package(
+                                conn, hp_detail["id"], updates,
+                                operator=st.session_state.hp_current_user,
+                                role=st.session_state.hp_user_role,
+                            )
+                        if r["success"]:
+                            st.success("✅ 修改已保存")
+                            st.rerun()
+                        else:
+                            st.error(f"❌ {r['error']}")
+                    else:
+                        st.info("没有修改内容")
+
+                st.divider()
+                st.markdown("### 🔄 状态流转")
+                valid_next = HP_VALID_TRANSITIONS.get(hp_detail["status"], [])
+                if valid_next:
+                    cols = st.columns(len(valid_next))
+                    for i, next_s in enumerate(valid_next):
+                        label = HP_STATUS_LABELS.get(next_s, next_s)
+                        with cols[i]:
+                            if st.button(f"→ {label}", key=f"hp_trans_{hp_detail['id']}_{next_s}", type="primary"):
+                                with get_conn() as conn:
+                                    r = transition_handover_status(
+                                        conn, hp_detail["id"], next_s,
+                                        operator=st.session_state.hp_current_user,
+                                        role=st.session_state.hp_user_role,
+                                    )
+                                if r["success"]:
+                                    st.success(f"✅ 已流转到: {label}")
+                                    st.rerun()
+                                else:
+                                    st.error(f"❌ {r['error']}")
+                else:
+                    st.info("已完成/已撤回，不可再流转")
+
+                st.divider()
+                st.markdown("### 📜 操作日志")
+                if hp_logs:
+                    for log in hp_logs:
+                        st.markdown(
+                            f"- **{log['operated_at'][:19]}** | "
+                            f"{log['operator']} | "
+                            f"{HP_ACTION_LABELS.get(log['action_type'], log['action_type'])} | "
+                            f"{log.get('action_detail') or ''}"
+                        )
+                else:
+                    st.info("暂无操作日志")
+            else:
+                st.error("交接包不存在")
+
+        elif hp_list:
+            st.markdown(f"共 **{len(hp_list)}** 个交接包")
+
+            header_cols = st.columns([0.5, 1.2, 2, 1, 1, 1, 0.8])
+            with header_cols[0]:
+                all_selected = len(st.session_state.hp_selected_ids) == len(hp_list) and hp_list
+                if st.checkbox("全选", value=all_selected, key="hp_select_all"):
+                    st.session_state.hp_selected_ids = [p["id"] for p in hp_list]
+                    with get_conn() as conn:
+                        save_hp_batch_selection(conn, st.session_state.hp_selected_ids)
+                else:
+                    if all_selected:
+                        st.session_state.hp_selected_ids = []
+                        with get_conn() as conn:
+                            save_hp_batch_selection(conn, [])
+            with header_cols[1]:
+                st.markdown("**包号**")
+            with header_cols[2]:
+                st.markdown("**标题**")
+            with header_cols[3]:
+                st.markdown("**接手人**")
+            with header_cols[4]:
+                st.markdown("**状态**")
+            with header_cols[5]:
+                st.markdown("**创建时间**")
+            with header_cols[6]:
+                st.markdown("**操作**")
+
+            for pkg in hp_list:
+                row_cols = st.columns([0.5, 1.2, 2, 1, 1, 1, 0.8])
+                with row_cols[0]:
+                    is_selected = pkg["id"] in st.session_state.hp_selected_ids
+                    if st.checkbox("", value=is_selected, key=f"hp_sel_{pkg['id']}"):
+                        if pkg["id"] not in st.session_state.hp_selected_ids:
+                            st.session_state.hp_selected_ids.append(pkg["id"])
+                            with get_conn() as conn:
+                                save_hp_batch_selection(conn, st.session_state.hp_selected_ids)
+                    else:
+                        if pkg["id"] in st.session_state.hp_selected_ids:
+                            st.session_state.hp_selected_ids.remove(pkg["id"])
+                            with get_conn() as conn:
+                                save_hp_batch_selection(conn, st.session_state.hp_selected_ids)
+
+                with row_cols[1]:
+                    st.markdown(f"**{pkg['pkg_no']}**")
+                with row_cols[2]:
+                    st.write(pkg["title"])
+                with row_cols[3]:
+                    st.write(pkg.get("receiver") or "未指定")
+                with row_cols[4]:
+                    st.markdown(_hp_status_badge(pkg["status"]), unsafe_allow_html=True)
+                with row_cols[5]:
+                    st.write(pkg["created_at"][:10])
+                with row_cols[6]:
+                    if st.button("查看", key=f"hp_view_{pkg['id']}"):
+                        st.session_state.hp_view = "detail"
+                        st.session_state.hp_detail_id = pkg["id"]
+                        st.rerun()
+
+            st.divider()
+            col_batch1, col_batch2, col_batch3 = st.columns(3)
+            with col_batch1:
+                if st.button("❌ 批量撤回", disabled=len(st.session_state.hp_selected_ids) == 0, key="hp_batch_withdraw"):
+                    fail_count = 0
+                    with get_conn() as conn:
+                        for pid in st.session_state.hp_selected_ids:
+                            r = transition_handover_status(
+                                conn, pid, HP_STATUS_WITHDRAWN,
+                                operator=st.session_state.hp_current_user,
+                                role=st.session_state.hp_user_role,
+                            )
+                            if not r["success"]:
+                                fail_count += 1
+                                st.warning(f"包ID {pid}: {r['error']}")
+                    success = len(st.session_state.hp_selected_ids) - fail_count
+                    if success > 0:
+                        st.success(f"批量撤回完成：成功 {success} 条，失败 {fail_count} 条")
+                        st.session_state.hp_selected_ids = []
+                        with get_conn() as conn:
+                            save_hp_batch_selection(conn, [])
+                        st.rerun()
+            with col_batch2:
+                st.write(f"已选: **{len(st.session_state.hp_selected_ids)}** 个")
+            with col_batch3:
+                if st.button("🔄 清空选择", key="hp_clear_selection"):
+                    st.session_state.hp_selected_ids = []
+                    with get_conn() as conn:
+                        save_hp_batch_selection(conn, [])
+                    st.rerun()
+        else:
+            st.info("暂无交接包，请到「新建交接包」标签页创建")
+
+    with hp_subtab2:
+        st.subheader("新建交接包")
+
+        with get_conn() as conn:
+            all_stores_hp = get_stores(conn)
+            all_discs = get_discrepancies(conn)
+
+        col_ns1, col_ns2 = st.columns(2)
+        with col_ns1:
+            ns_store_filter = st.selectbox(
+                "按门店筛选差异",
+                ["全部"] + all_stores_hp,
+                key="ns_store_filter",
+            )
+        with col_ns2:
+            ns_status_filter = st.selectbox(
+                "按状态筛选差异",
+                ["全部"] + list(STATUS_LABELS.keys()),
+                format_func=lambda x: "全部" if x == "全部" else STATUS_LABELS.get(x, x),
+                key="ns_status_filter",
+            )
+
+        filtered_discs_hp = all_discs
+        if ns_store_filter != "全部":
+            filtered_discs_hp = [d for d in filtered_discs_hp if d["store_id"] == ns_store_filter]
+        if ns_status_filter != "全部":
+            filtered_discs_hp = [d for d in filtered_discs_hp if d["status"] == ns_status_filter]
+
+        st.markdown(f"可交接差异: **{len(filtered_discs_hp)}** 条")
+
+        if filtered_discs_hp:
+            hp_sel_key = "hp_create_selected"
+
+            col_nsa1, col_nsa2 = st.columns([1, 3])
+            with col_nsa1:
+                if st.button("📋 全选当前筛选结果", key="ns_select_all"):
+                    st.session_state[hp_sel_key] = [d["id"] for d in filtered_discs_hp]
+                if st.button("🔄 清空选择", key="ns_clear_selection"):
+                    st.session_state[hp_sel_key] = []
+            with col_nsa2:
+                st.write(f"已选择: **{len(st.session_state[hp_sel_key])}** 条差异")
+
+            st.markdown("#### 差异列表")
+            for d in filtered_discs_hp:
+                cols = st.columns([0.5, 1, 2, 1, 1, 1])
+                is_selected = d["id"] in st.session_state[hp_sel_key]
+                with cols[0]:
+                    if st.checkbox("", value=is_selected, key=f"ns_sel_{d['id']}"):
+                        if d["id"] not in st.session_state[hp_sel_key]:
+                            st.session_state[hp_sel_key].append(d["id"])
+                    else:
+                        if d["id"] in st.session_state[hp_sel_key]:
+                            st.session_state[hp_sel_key].remove(d["id"])
+                with cols[1]:
+                    st.write(d["store_id"])
+                with cols[2]:
+                    st.write(f"{d.get('sku_name') or d['barcode']}")
+                with cols[3]:
+                    st.write(f"差异: {d['diff_qty']:+.1f}")
+                cause_label = CAUSE_LABELS.get(d['attributed_cause'], d['attributed_cause'] or "未归因")
+                with cols[4]:
+                    st.write(cause_label)
+                with cols[5]:
+                    st.markdown(_status_badge(d["status"]), unsafe_allow_html=True)
+
+            with get_conn() as conn:
+                save_hp_draft(conn, {
+                    "selected_ids": st.session_state[hp_sel_key],
+                    "store_filter": ns_store_filter,
+                    "status_filter": ns_status_filter,
+                })
+
+            st.divider()
+            st.markdown("#### 📝 交接包信息")
+
+            col_nf1, col_nf2 = st.columns(2)
+            with col_nf1:
+                new_hp_title = st.text_input("标题 *", key="new_hp_title", placeholder="例如：早班遗留差异交接")
+                new_hp_receiver = st.text_input("接手人", key="new_hp_receiver", placeholder="下一班负责人")
+            with col_nf2:
+                new_hp_desc = st.text_area("描述", key="new_hp_desc", height=68, placeholder="交接包简要描述")
+                new_hp_note = st.text_area("交接说明", key="new_hp_note", height=68, placeholder="需要接手人关注的事项")
+
+            current_filter_snap = {
+                "store_id": ns_store_filter if ns_store_filter != "全部" else None,
+                "status": ns_status_filter if ns_status_filter != "全部" else None,
+            }
+
+            if st.button("✅ 确认建包", type="primary", disabled=len(st.session_state[hp_sel_key]) == 0, key="ns_confirm_create"):
+                if not new_hp_title.strip():
+                    st.error("请填写标题")
+                else:
+                    with get_conn() as conn:
+                        result = create_handover_package(
+                            conn,
+                            title=new_hp_title.strip(),
+                            discrepancy_ids=st.session_state[hp_sel_key],
+                            receiver=new_hp_receiver.strip() if new_hp_receiver.strip() else None,
+                            handover_note=new_hp_note.strip() if new_hp_note.strip() else None,
+                            description=new_hp_desc.strip() if new_hp_desc.strip() else None,
+                            filter_snapshot=current_filter_snap,
+                            created_by=st.session_state.hp_current_user,
+                        )
+                    if result["success"]:
+                        st.success(f"✅ 交接包创建成功！包号: {result['pkg_no']}，包含 {len(st.session_state[hp_sel_key])} 条差异")
+                        st.session_state[hp_sel_key] = []
+                        with get_conn() as conn:
+                            clear_hp_draft(conn)
+                        st.rerun()
+                    else:
+                        st.error(f"❌ {result['error']}")
+        else:
+            st.info("当前没有可交接的差异记录")
+
+    with hp_subtab3:
+        st.subheader("导出 / 导回")
+
+        hp_exp_tab, hp_imp_tab = st.tabs(["📤 导出", "📥 导回预检"])
+
+        with hp_exp_tab:
+            st.markdown("#### 按筛选条件导出")
+
+            with get_conn() as conn:
+                exp_hp_stores = get_hp_stores(conn)
+                exp_hp_receivers = get_hp_receivers(conn)
+
+            col_exf1, col_exf2, col_exf3 = st.columns(3)
+            with col_exf1:
+                exp_hp_store = st.selectbox(
+                    "门店",
+                    ["全部"] + exp_hp_stores,
+                    key="exp_hp_store",
+                )
+            with col_exf2:
+                exp_hp_status = st.selectbox(
+                    "状态",
+                    ["全部"] + list(HP_STATUS_LABELS.keys()),
+                    format_func=lambda x: "全部" if x == "全部" else HP_STATUS_LABELS.get(x, x),
+                    key="exp_hp_status",
+                )
+            with col_exf3:
+                exp_hp_receiver = st.selectbox(
+                    "接手人",
+                    ["全部"] + exp_hp_receivers,
+                    key="exp_hp_receiver",
+                )
+
+            exp_hp_store_param = None if exp_hp_store == "全部" else exp_hp_store
+            exp_hp_status_param = None if exp_hp_status == "全部" else exp_hp_status
+            exp_hp_receiver_param = None if exp_hp_receiver == "全部" else exp_hp_receiver
+
+            with get_conn() as conn:
+                export_hp_data = export_handover_packages_json(
+                    conn,
+                    store_id=exp_hp_store_param,
+                    status=exp_hp_status_param,
+                    receiver=exp_hp_receiver_param,
+                )
+
+            col_dl1, col_dl2 = st.columns(2)
+            with col_dl1:
+                json_str = json.dumps(export_hp_data, ensure_ascii=False, indent=2, default=str)
+                st.download_button(
+                    "⬇️ 下载 JSON",
+                    data=json_str.encode("utf-8"),
+                    file_name=f"handover_packages_{now_iso()[:10]}.json",
+                    mime="application/json",
+                )
+            with col_dl2:
+                packages_flat = []
+                for pkg in export_hp_data["handover_packages"]:
+                    items = pkg.get("items", [])
+                    for it in items:
+                        packages_flat.append({
+                            "pkg_no": pkg["pkg_no"],
+                            "title": pkg["title"],
+                            "status": HP_STATUS_LABELS.get(pkg["status"], pkg["status"]),
+                            "receiver": pkg.get("receiver", ""),
+                            "store_id": it.get("store_id", ""),
+                            "barcode": it.get("barcode", ""),
+                            "sku_name": it.get("sku_name", ""),
+                            "diff_qty": it.get("diff_qty", 0),
+                            "disc_status": STATUS_LABELS.get(it.get("disc_status"), it.get("disc_status", "")),
+                            "review_note": it.get("review_note", ""),
+                            "handover_note": pkg.get("handover_note", ""),
+                            "created_by": pkg.get("created_by", ""),
+                            "created_at": pkg.get("created_at", ""),
+                        })
+                if packages_flat:
+                    df = pd.DataFrame(packages_flat)
+                    csv_buf = io.StringIO()
+                    df.to_csv(csv_buf, index=False, encoding="utf-8-sig")
+                    csv_content = csv_buf.getvalue()
+                    st.download_button(
+                        "⬇️ 下载 CSV",
+                        data=csv_content.encode("utf-8-sig"),
+                        file_name=f"handover_packages_{now_iso()[:10]}.csv",
+                        mime="text/csv",
+                    )
+                else:
+                    st.info("没有数据可导出")
+
+            st.markdown(f"导出范围: **{export_hp_data['total']}** 个交接包")
+
+        with hp_imp_tab:
+            st.markdown("#### 导回预检与确认")
+            st.info("导入交接包 JSON 文件后，系统会检测冲突（本地状态更晚、负责人不同、备注被改过等），不会静默覆盖。")
+
+            uploaded_hp = st.file_uploader("上传交接包 JSON 文件", type=["json"], key="hp_import_upload")
+
+            if uploaded_hp:
+                try:
+                    import_content = json.loads(uploaded_hp.read())
+
+                    with get_conn() as conn:
+                        preview = preview_handover_packages_import(conn, import_content)
+
+                    if preview["success"]:
+                        st.success(
+                            f"✅ 预检完成：总计 {preview['total']} 个，"
+                            f"新建 {preview['new_count']} 个，"
+                            f"可安全接收 {preview['safe_count']} 个，"
+                            f"存在冲突 {preview['conflict_count']} 个"
+                        )
+
+                        for item in preview["preview_results"]:
+                            if item["import_status"] == "new":
+                                st.markdown(f"🆕 **{item['pkg_no']}** - {item.get('title', '')} → {item['reason']}")
+                            elif item["import_status"] == "safe":
+                                st.markdown(f"✅ **{item['pkg_no']}** - {item.get('title', '')} → {item['reason']}")
+                            elif item["import_status"] == "conflict":
+                                st.warning(f"⚠️ **{item['pkg_no']}** - {item.get('title', '')} → {item['reason']}")
+                                for c in item["conflicts"]:
+                                    st.markdown(f"  - 🔴 {c['message']}")
+
+                        has_safe_or_new = any(
+                            r["import_status"] in ("new", "safe")
+                            for r in preview["preview_results"]
+                        )
+
+                        if has_safe_or_new and st.button("✅ 确认导入（仅处理无冲突项）", type="primary", key="hp_confirm_import"):
+                            with get_conn() as conn:
+                                result = confirm_handover_packages_import(
+                                    conn, preview["preview_results"],
+                                    preview["import_data"],
+                                    operator=st.session_state.hp_current_user,
+                                )
+                            if result["success"]:
+                                st.success(
+                                    f"✅ 导入完成：总计 {result['total']} 个，"
+                                    f"新建 {result['created_count']} 个，"
+                                    f"接收 {result['received_count']} 个，"
+                                    f"跳过 {result['skipped_count']} 个，"
+                                    f"失败 {result['failed_count']} 个"
+                                )
+                                if result["failed_count"] > 0:
+                                    for r in result["results"]:
+                                        if r["action"] == "failed":
+                                            st.warning(f"{r['pkg_no']}: {r.get('reason', '未知错误')}")
+                            else:
+                                st.error("导入失败")
+                    else:
+                        st.error(f"❌ {preview.get('error', '预检失败')}")
+                except json.JSONDecodeError:
+                    st.error("❌ JSON 文件格式错误，请上传有效的 JSON 文件")
+
+    with hp_subtab4:
+        st.subheader("操作日志")
+
+        col_lf1, col_lf2 = st.columns(2)
+        with col_lf1:
+            hp_log_operator = st.text_input("按操作人筛选", key="hp_log_operator_filter")
+        with col_lf2:
+            hp_log_action_type = st.selectbox(
+                "按操作类型筛选",
+                ["全部"] + list(HP_ACTION_LABELS.keys()),
+                format_func=lambda x: "全部" if x == "全部" else HP_ACTION_LABELS.get(x, x),
+                key="hp_log_action_filter",
+            )
+
+        with get_conn() as conn:
+            all_hp_logs = get_all_handover_logs(
+                conn,
+                operator=hp_log_operator.strip() if hp_log_operator.strip() else None,
+                action_type=None if hp_log_action_type == "全部" else hp_log_action_type,
+                limit=500,
+            )
+
+        if all_hp_logs:
+            st.markdown(f"共 **{len(all_hp_logs)}** 条日志（最多显示 500 条）")
+            for log in all_hp_logs:
+                st.markdown(
+                    f"- **{log['operated_at'][:19]}** | "
+                    f"包: `{log.get('pkg_no', '-')}` | "
+                    f"操作人: {log['operator']} | "
+                    f"{HP_ACTION_LABELS.get(log['action_type'], log['action_type'])} | "
+                    f"{log.get('action_detail') or ''}"
+                )
+        else:
+            st.info("暂无操作日志")
+
+    with hp_subtab5:
+        st.subheader("恢复交接视角与待办")
+
+        with get_conn() as conn:
+            hp_all = list_handover_packages(conn)
+
+        my_pending = [
+            p for p in hp_all
+            if p["status"] in (HP_STATUS_PENDING_HANDOVER, HP_STATUS_RECEIVED, HP_STATUS_PROCESSING)
+            and (p.get("receiver") == st.session_state.hp_current_user or st.session_state.hp_user_role == HP_ROLE_ADMIN)
+        ]
+
+        if my_pending:
+            st.markdown(f"您有 **{len(my_pending)}** 个待处理交接包")
+            for p in my_pending:
+                col_v1, col_v2, col_v3 = st.columns([2, 1, 1])
+                with col_v1:
+                    st.markdown(f"**{p['pkg_no']}** - {p['title']}")
+                with col_v2:
+                    st.markdown(_hp_status_badge(p["status"]), unsafe_allow_html=True)
+                with col_v3:
+                    if st.button("恢复视角", key=f"hp_restore_{p['id']}"):
+                        with get_conn() as conn:
+                            pkg = get_handover_package(conn, p["id"])
+                        if pkg and pkg.get("filter_snapshot"):
+                            try:
+                                fs = pkg["filter_snapshot"]
+                                if isinstance(fs, str):
+                                    fs = json.loads(fs)
+                                st.session_state.hp_filter_store = fs.get("store_id", "全部") or "全部"
+                                st.session_state.hp_filter_status = fs.get("status", "全部") or "全部"
+                                with get_conn() as conn:
+                                    save_hp_ui_state(conn, {
+                                        "filter_store": st.session_state.hp_filter_store,
+                                        "filter_status": st.session_state.hp_filter_status,
+                                        "filter_receiver": "全部",
+                                        "keyword": "",
+                                    })
+                                st.success(f"✅ 已恢复筛选视角：门店={st.session_state.hp_filter_store}，状态={st.session_state.hp_filter_status}")
+                            except (json.JSONDecodeError, TypeError):
+                                st.warning("筛选快照格式异常，无法恢复")
+                        else:
+                            st.info("该交接包没有保存筛选快照")
+
+                        items = pkg.get("items", []) if pkg else []
+                        if items:
+                            disc_ids = [it["discrepancy_id"] for it in items]
+                            st.session_state.hp_create_selected = disc_ids
+                            st.info(f"已恢复待办清单：{len(disc_ids)} 条差异")
+
+                        st.session_state.hp_detail_id = p["id"]
+                        st.session_state.hp_view = "detail"
+                        st.rerun()
+        else:
+            st.info("您当前没有待处理的交接包")
+
+        st.divider()
+        st.markdown("#### 恢复草稿")
+        if saved_hp_draft:
+            st.markdown(f"发现未提交的草稿：")
+            st.json(saved_hp_draft)
+            col_dr1, col_dr2 = st.columns(2)
+            with col_dr1:
+                if st.button("✅ 恢复草稿到新建页", key="hp_restore_draft"):
+                    st.session_state.hp_create_selected = saved_hp_draft.get("selected_ids", [])
+                    st.success(f"已恢复 {len(saved_hp_draft.get('selected_ids', []))} 条已选差异")
+            with col_dr2:
+                if st.button("🗑️ 清除草稿", key="hp_clear_draft_btn"):
+                    with get_conn() as conn:
+                        clear_hp_draft(conn)
+                    st.success("草稿已清除")
+                    st.rerun()
+        else:
+            st.info("没有未提交的草稿")
+
+    st.divider()
+    col_hprole1, col_hprole2 = st.columns([3, 1])
+    with col_hprole1:
+        st.caption(
+            f"当前用户: **{st.session_state.hp_current_user}** | "
+            f"角色: **{'管理员' if st.session_state.hp_user_role == HP_ROLE_ADMIN else '普通用户'}**"
+        )
+    with col_hprole2:
+        if st.button("🔄 切换角色（模拟）", key="hp_toggle_role"):
+            if st.session_state.hp_user_role == HP_ROLE_ADMIN:
+                st.session_state.hp_user_role = HP_ROLE_NORMAL
+                st.session_state.hp_current_user = "normal_user"
+            else:
+                st.session_state.hp_user_role = HP_ROLE_ADMIN
+                st.session_state.hp_current_user = "admin_user"
             st.rerun()

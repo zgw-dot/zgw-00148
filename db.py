@@ -1262,6 +1262,8 @@ def _execute_scheme_import(conn, preview_results):
         description = pr.get("description")
         filter_state = pr.get("filter_state", {})
         data_date_range = pr.get("data_date_range")
+        extra_detail = pr.get("note", "")
+        rename_suffix = pr.get("rename_suffix", "")
 
         existing = conn.execute(
             "SELECT * FROM review_schemes WHERE name = ?", (original_name,)
@@ -1288,7 +1290,7 @@ def _execute_scheme_import(conn, preview_results):
                 if existing_rec:
                     log_scheme_operation(
                         conn, dict(existing_rec)["id"], target_name, "import_scheme",
-                        f"导入方案包跳过(状态变化): '{target_name}'",
+                        f"导入决策=保留，原因=状态变化，方案='{target_name}'，备注={extra_detail or '(无)'}",
                     )
                 continue
 
@@ -1307,7 +1309,7 @@ def _execute_scheme_import(conn, preview_results):
                 })
                 log_scheme_operation(
                     conn, existing_dict["id"], original_name, "import_scheme",
-                    f"导入方案包跳过(保留原方案): '{original_name}'",
+                    f"导入决策=保留，原因={pr.get('reason','方案已存在')}，方案='{original_name}'，备注={extra_detail or '(无)'}",
                 )
                 continue
             elif pr["action"] == SCHEME_ACTION_OVERWRITTEN:
@@ -1329,7 +1331,7 @@ def _execute_scheme_import(conn, preview_results):
                 })
                 log_scheme_operation(
                     conn, existing_id, original_name, "import_scheme",
-                    f"导入方案包覆盖: '{original_name}'",
+                    f"导入决策=覆盖，方案='{original_name}'，备注={extra_detail or '(无)'}",
                 )
                 continue
             elif pr["action"] == SCHEME_ACTION_RENAMED:
@@ -1352,7 +1354,7 @@ def _execute_scheme_import(conn, preview_results):
                 })
                 log_scheme_operation(
                     conn, scheme_id, target_name, "import_scheme",
-                    f"导入方案包改名: '{original_name}' -> '{target_name}'",
+                    f"导入决策=改名，原名='{original_name}'，新名='{target_name}'，后缀={rename_suffix or '(导入)'}，备注={extra_detail or '(无)'}",
                 )
                 continue
         else:
@@ -1377,7 +1379,7 @@ def _execute_scheme_import(conn, preview_results):
                 })
                 log_scheme_operation(
                     conn, scheme_id, target_name, "import_scheme",
-                    f"导入方案包改名: '{original_name}' -> '{target_name}'",
+                    f"导入决策=改名(新方案)，原名='{original_name}'，新名='{target_name}'，后缀={rename_suffix or '(导入)'}，备注={extra_detail or '(无)'}",
                 )
             else:
                 results.append({
@@ -1387,7 +1389,7 @@ def _execute_scheme_import(conn, preview_results):
                 })
                 log_scheme_operation(
                     conn, scheme_id, target_name, "import_scheme",
-                    f"导入方案包新建: '{target_name}'",
+                    f"导入决策=新建，方案='{target_name}'，备注={extra_detail or '(无)'}",
                 )
             continue
 
@@ -1610,6 +1612,9 @@ def confirm_partial_scheme_import(conn, preview_context, selected_indices, item_
 
     selected_set = set(selected_indices)
     items_to_import = []
+    processed_indices = []
+    index_tracking = {}
+
     for i, pr in enumerate(preview_results):
         if i not in selected_set:
             continue
@@ -1617,16 +1622,23 @@ def confirm_partial_scheme_import(conn, preview_context, selected_indices, item_
         decision = item_decisions.get(str(i), {}) if item_decisions else {}
         override_action = decision.get("action")
         note = decision.get("note", "")
+        rename_suffix = decision.get("rename_suffix", "")
 
         item = dict(pr)
+        item["note"] = note
+        if rename_suffix:
+            item["rename_suffix"] = rename_suffix
+
         if override_action and override_action in (
             SCHEME_ACTION_CREATED, SCHEME_ACTION_OVERWRITTEN,
             SCHEME_ACTION_RENAMED, SCHEME_ACTION_KEPT
         ):
             original_name = pr.get("original_name", pr["name"])
-            if override_action == SCHEME_ACTION_RENAMED and pr["action"] != SCHEME_ACTION_RENAMED:
-                rename_suffix = decision.get("rename_suffix", "(导入)")
-                new_name = _compute_rename_target(conn, original_name, rename_suffix)
+            if override_action == SCHEME_ACTION_RENAMED:
+                effective_suffix = rename_suffix or "(导入)"
+                if not item.get("rename_suffix"):
+                    item["rename_suffix"] = effective_suffix
+                new_name = _compute_rename_target(conn, original_name, effective_suffix)
                 item["name"] = new_name
             elif override_action == SCHEME_ACTION_OVERWRITTEN:
                 existing = conn.execute(
@@ -1636,18 +1648,18 @@ def confirm_partial_scheme_import(conn, preview_context, selected_indices, item_
                     item["existing_id"] = dict(existing)["id"]
             item["action"] = override_action
 
-        item["note"] = note
+        processing_order = len(processed_indices)
+        index_tracking[processing_order] = i
+        processed_indices.append(i)
         items_to_import.append(item)
 
     result = _execute_scheme_import(conn, items_to_import)
 
     if result["success"]:
-        for r in result["results"]:
-            idx = None
-            for i, pr in enumerate(preview_results):
-                if i in selected_set and pr.get("original_name", pr["name"]) == r.get("original_name", r["name"]):
-                    idx = i
-                    break
+        result["processed_indices"] = processed_indices
+
+        for processing_order, r in enumerate(result["results"]):
+            idx = index_tracking.get(processing_order)
             if idx is not None:
                 decision = item_decisions.get(str(idx), {}) if item_decisions else {}
                 note = decision.get("note", "")
@@ -1662,7 +1674,207 @@ def confirm_partial_scheme_import(conn, preview_context, selected_indices, item_
         result["remaining_count"] = len(remaining)
         result["remaining_items"] = remaining
 
+        remaining_indices = [i for i in range(len(preview_results)) if i not in selected_set]
+        result["remaining_indices"] = remaining_indices
+
+        original_pkg = preview_context.get("package", {})
+        original_schemes = original_pkg.get("schemes", [])
+        remaining_schemes_in_pkg = []
+        for ri in remaining_indices:
+            if ri < len(original_schemes):
+                remaining_schemes_in_pkg.append(original_schemes[ri])
+        result["remaining_package_schemes"] = remaining_schemes_in_pkg
+
+        remaining_decisions = {}
+        for old_idx in remaining_indices:
+            old_key = str(old_idx)
+            if old_key in (item_decisions or {}):
+                remaining_decisions[old_key] = item_decisions[old_key]
+        result["remaining_decisions_raw"] = remaining_decisions
+        result["conflict_policy"] = preview_context.get("summary", {}).get("conflict_policy", "keep")
+        result["rename_suffix_global"] = preview_context.get("summary", {}).get("rename_suffix")
+
     return result
+
+
+def shrink_batch_to_remaining(conn, original_batch_id, processed_indices,
+                               conflict_policy=None, rename_suffix=None):
+    original_batch = load_import_batch(conn, original_batch_id)
+    if not original_batch:
+        return {"success": False, "error": f"批次不存在: {original_batch_id}"}
+
+    preview = original_batch["preview"]
+    package = original_batch["package"]
+    old_preview_results = preview.get("preview_results", [])
+    old_schemes = package.get("schemes", [])
+    old_decisions = original_batch.get("item_decisions", {})
+    old_selected = original_batch.get("selected_indices", [])
+
+    processed_set = set(processed_indices)
+    remaining_old_indices = [i for i in range(len(old_preview_results)) if i not in processed_set]
+
+    if not remaining_old_indices:
+        mark_batch_completed(conn, original_batch_id)
+        log_scheme_operation(
+            conn, None, f"batch:{original_batch_id[:8]}", "batch_close",
+            f"批次全部处理完成，标记完成。共处理 {len(processed_set)} 个方案",
+        )
+        return {
+            "success": True,
+            "remaining_count": 0,
+            "new_batch_id": None,
+            "all_completed": True,
+            "original_batch_id": original_batch_id,
+        }
+
+    new_index_mapping = {}
+    remaining_preview_results = []
+    remaining_schemes = []
+    for new_idx, old_idx in enumerate(remaining_old_indices):
+        new_index_mapping[old_idx] = new_idx
+        if old_idx < len(old_preview_results):
+            remaining_preview_results.append(old_preview_results[old_idx])
+        if old_idx < len(old_schemes):
+            remaining_schemes.append(old_schemes[old_idx])
+
+    remaining_decisions = {}
+    for old_idx in remaining_old_indices:
+        old_key = str(old_idx)
+        if old_key in old_decisions:
+            new_key = str(new_index_mapping[old_idx])
+            remaining_decisions[new_key] = old_decisions[old_key]
+
+    remaining_old_selected_set = set()
+    for si in old_selected:
+        if si in new_index_mapping:
+            remaining_old_selected_set.add(new_index_mapping[si])
+    remaining_selected_indices = sorted(list(remaining_old_selected_set))
+
+    remaining_pkg = {
+        "version": package.get("version", "1.0"),
+        "exported_at": package.get("exported_at", now_iso()),
+        "scheme_count": len(remaining_schemes),
+        "schemes": remaining_schemes,
+    }
+
+    eff_policy = conflict_policy or preview.get("summary", {}).get("conflict_policy", "keep")
+    eff_suffix = rename_suffix or preview.get("summary", {}).get("rename_suffix")
+
+    remaining_preview = preview_scheme_package_import(
+        conn, remaining_pkg, conflict_policy=eff_policy, rename_suffix=eff_suffix
+    )
+    if not remaining_preview["success"]:
+        return {
+            "success": False,
+            "error": f"重新生成剩余预检失败: {remaining_preview.get('error','')}",
+        }
+
+    for new_idx in range(len(remaining_preview_results)):
+        if new_idx < len(remaining_preview["preview_results"]):
+            rp = remaining_preview["preview_results"][new_idx]
+            dec = remaining_decisions.get(str(new_idx), {})
+            if "action" in dec:
+                override_action = dec["action"]
+                if override_action in (SCHEME_ACTION_CREATED, SCHEME_ACTION_OVERWRITTEN,
+                                       SCHEME_ACTION_RENAMED, SCHEME_ACTION_KEPT):
+                    rp["action"] = override_action
+                    if override_action == SCHEME_ACTION_RENAMED:
+                        suffix = dec.get("rename_suffix") or eff_suffix or "(导入)"
+                        oname = rp.get("original_name", rp["name"])
+                        rp["name"] = _compute_rename_target(conn, oname, suffix)
+
+    new_batch_id = f"{original_batch_id.split('-part-')[0]}-part-{len(processed_set)}-{uuid.uuid4().hex[:8]}"
+    if original_batch_id.startswith("batch-") and "-part-" not in original_batch_id:
+        new_batch_id = f"{original_batch_id}-part-{len(processed_set)}-{uuid.uuid4().hex[:8]}"
+
+    save_import_batch(
+        conn, new_batch_id, remaining_pkg, remaining_preview,
+        selected_indices=remaining_selected_indices,
+        item_decisions=remaining_decisions,
+    )
+
+    mark_batch_completed(conn, original_batch_id)
+    log_scheme_operation(
+        conn, None, f"batch:{original_batch_id[:8]}", "batch_shrink",
+        f"批次收口，已处理 {len(processed_set)} 个方案，剩余 {len(remaining_old_indices)} 个转入新批次 {new_batch_id[:16]}...",
+    )
+    log_scheme_operation(
+        conn, None, f"batch:{new_batch_id[:8]}", "batch_create_remaining",
+        f"从 {original_batch_id[:16]}... 分出剩余批次，含 {len(remaining_old_indices)} 个方案",
+    )
+
+    return {
+        "success": True,
+        "remaining_count": len(remaining_old_indices),
+        "new_batch_id": new_batch_id,
+        "all_completed": False,
+        "original_batch_id": original_batch_id,
+        "remaining_package": remaining_pkg,
+        "remaining_preview": remaining_preview,
+        "remaining_selected_indices": remaining_selected_indices,
+        "remaining_item_decisions": remaining_decisions,
+    }
+
+
+def list_all_batches(conn, status=None):
+    if status:
+        rows = conn.execute(
+            "SELECT * FROM scheme_import_batches WHERE status = ? ORDER BY updated_at DESC",
+            (status,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM scheme_import_batches ORDER BY updated_at DESC"
+        ).fetchall()
+    results = []
+    for r in rows:
+        d = dict(r)
+        try:
+            preview = json.loads(d["preview_json"]) if d.get("preview_json") else {}
+        except (TypeError, json.JSONDecodeError):
+            preview = {}
+        summary = preview.get("summary", {})
+        try:
+            sel = json.loads(d["selected_indices_json"]) if d.get("selected_indices_json") else []
+        except (TypeError, json.JSONDecodeError):
+            sel = []
+        results.append({
+            "batch_id": d["batch_id"],
+            "scheme_count": summary.get("scheme_count", 0),
+            "created_count": summary.get("created_count", 0),
+            "conflict_count": (summary.get("overwritten_count", 0) +
+                               summary.get("renamed_count", 0) +
+                               summary.get("kept_count", 0)),
+            "selected_count": len(sel),
+            "status": d["status"],
+            "created_at": d["created_at"],
+            "updated_at": d["updated_at"],
+        })
+    return results
+
+
+def get_import_decision_logs(conn, scheme_name=None, batch_id=None,
+                            operation_type="import_scheme", limit=200):
+    sql = "SELECT * FROM review_scheme_operations WHERE 1=1"
+    params = []
+    if scheme_name:
+        sql += " AND scheme_name LIKE ?"
+        params.append(f"%{scheme_name}%")
+    if batch_id:
+        sql += " AND operation_detail LIKE ?"
+        params.append(f"%{batch_id}%")
+    if operation_type:
+        if "," in operation_type:
+            placeholders = ",".join("?" for _ in operation_type.split(","))
+            sql += f" AND operation_type IN ({placeholders})"
+            params.extend([t.strip() for t in operation_type.split(",")])
+        else:
+            sql += " AND operation_type = ?"
+            params.append(operation_type)
+    sql += " ORDER BY operated_at DESC LIMIT ?"
+    params.append(limit)
+    rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
 
 
 def export_scheme_manifest(conn, scheme_ids=None, name_filter=None, updated_after=None):

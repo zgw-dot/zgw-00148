@@ -29,7 +29,8 @@ from db import (
     compute_scheme_diff, save_import_batch, load_import_batch,
     list_pending_batches, update_batch_selection, clear_import_batch,
     mark_batch_completed, confirm_partial_scheme_import,
-    export_scheme_manifest,
+    export_scheme_manifest, shrink_batch_to_remaining,
+    list_all_batches, get_import_decision_logs,
 )
 from import_service import import_csv
 from engine import run_attribution, CAUSE_LABELS
@@ -1040,12 +1041,58 @@ with tab6:
                     "方案名包含",
                     value="",
                     key="manifest_name_filter",
+                    placeholder="如：L3、冲突、复盘"
                 )
-                manifest_updated_after = st.text_input(
-                    "更新时间晚于（如 2026-01-01）",
-                    value="",
-                    key="manifest_updated_after",
+
+                if exportable_schemes:
+                    all_updated = [s["updated_at"] for s in exportable_schemes if s.get("updated_at")]
+                    if all_updated:
+                        max_updated = max(all_updated)[:10]
+                        min_updated = min(all_updated)[:10]
+                    else:
+                        max_updated = now_iso()[:10]
+                        min_updated = "2026-01-01"
+                else:
+                    max_updated = now_iso()[:10]
+                    min_updated = "2026-01-01"
+
+                st.caption(f"方案更新时间范围：{min_updated} ~ {max_updated}")
+                date_preset = st.selectbox(
+                    "时间快捷筛选",
+                    ["不筛选", "最近7天", "最近30天", "最近90天", "2026年之后", "自定义"],
+                    key="manifest_date_preset",
+                    index=0,
                 )
+                custom_updated_after = ""
+                if date_preset == "自定义":
+                    custom_updated_after = st.text_input(
+                        "自定义起始日期（YYYY-MM-DD）",
+                        value="",
+                        key="manifest_custom_date",
+                        placeholder=f"如：{min_updated}"
+                    )
+                elif date_preset == "不筛选":
+                    custom_updated_after = ""
+                elif date_preset == "最近7天":
+                    from datetime import timedelta
+                    today = datetime.now()
+                    week_ago = today - timedelta(days=7)
+                    custom_updated_after = week_ago.isoformat()[:10]
+                elif date_preset == "最近30天":
+                    from datetime import timedelta
+                    today = datetime.now()
+                    month_ago = today - timedelta(days=30)
+                    custom_updated_after = month_ago.isoformat()[:10]
+                elif date_preset == "最近90天":
+                    from datetime import timedelta
+                    today = datetime.now()
+                    qtr_ago = today - timedelta(days=90)
+                    custom_updated_after = qtr_ago.isoformat()[:10]
+                elif date_preset == "2026年之后":
+                    custom_updated_after = "2026-01-01"
+
+                manifest_updated_after = custom_updated_after
+
                 scheme_opts = [(s["id"], s["name"]) for s in exportable_schemes]
                 selected_export_names = st.multiselect(
                     "选择要导出的方案",
@@ -1126,14 +1173,38 @@ with tab6:
             pending_batches = list_pending_batches(conn)
 
         if pending_batches:
-            st.warning(f"📋 有 {len(pending_batches)} 个待处理批次")
+            only_one = len(pending_batches) == 1
+            auto_restored = False
+            if only_one and "batch_id" not in st.session_state and not parsed_pkg and not saved_preview:
+                auto_batch = load_import_batch(conn, pending_batches[0]["batch_id"])
+                if auto_batch:
+                    st.session_state.parsed_pkg = auto_batch["package"]
+                    st.session_state.preview_result = auto_batch["preview"]
+                    st.session_state.batch_id = auto_batch["batch_id"]
+                    st.session_state.selected_indices = auto_batch.get("selected_indices", [])
+                    st.session_state.item_decisions = auto_batch.get("item_decisions", {})
+                    auto_policy = auto_batch["preview"].get("summary", {}).get("conflict_policy")
+                    auto_suffix = auto_batch["preview"].get("summary", {}).get("rename_suffix")
+                    if auto_policy:
+                        st.session_state.selected_policy = auto_policy
+                    if auto_suffix:
+                        st.session_state.rename_suffix = auto_suffix
+                    auto_restored = True
+                    st.success(
+                        f"💡 自动恢复上次剩余批次（{auto_batch['batch_id'][:12]}...），"
+                        f"共 {len(auto_batch.get('selected_indices', []))} 项已勾选，"
+                        f"{len(auto_batch.get('item_decisions', {}))} 项有决策备注"
+                    )
+
+            if not auto_restored:
+                st.warning(f"📋 有 {len(pending_batches)} 个待处理批次")
             batch_options = [
                 f"{b['batch_id'][:8]}... ({b['scheme_count']}个方案, {b['created_at'][:19]})"
                 for b in pending_batches
             ]
             batch_options.append("（不恢复）")
             selected_batch_idx = st.selectbox(
-                "恢复待处理批次",
+                "恢复待处理批次（或切换批次）",
                 range(len(batch_options)),
                 format_func=lambda i: batch_options[i],
                 key="select_pending_batch",
@@ -1147,13 +1218,22 @@ with tab6:
                         st.session_state.batch_id = batch["batch_id"]
                         st.session_state.selected_indices = batch.get("selected_indices", [])
                         st.session_state.item_decisions = batch.get("item_decisions", {})
+                        bpol = batch["preview"].get("summary", {}).get("conflict_policy")
+                        bsuf = batch["preview"].get("summary", {}).get("rename_suffix")
+                        if bpol:
+                            st.session_state.selected_policy = bpol
+                        if bsuf:
+                            st.session_state.rename_suffix = bsuf
                         st.rerun()
             if st.button("🗑️ 清除所有待处理批次", key="clear_all_batches"):
                 with get_conn() as conn:
                     for b in pending_batches:
                         clear_import_batch(conn, b["batch_id"])
-                if "batch_id" in st.session_state:
-                    del st.session_state["batch_id"]
+                for k in ["batch_id", "parsed_pkg", "preview_result",
+                          "selected_indices", "item_decisions",
+                          "selected_policy", "rename_suffix"]:
+                    if k in st.session_state:
+                        del st.session_state[k]
                 st.rerun()
             st.divider()
 
@@ -1318,6 +1398,35 @@ with tab6:
                         if summary.get("min_date") and summary.get("max_date"):
                             st.caption(f"📊 数据时间范围: {summary['min_date'][:10]} ~ {summary['max_date'][:10]}")
 
+                    with st.expander("🔍 回放预检状态对拍（已入库/待处理/冲突结果一览）", expanded=False):
+                        st.caption("逐个核对：当前DB状态 ↔ 包内版本 ↔ 预检处理结果")
+                        for i, item in enumerate(preview_items):
+                            original_name = item.get("original_name", item["name"])
+                            target_name = item["name"]
+                            action = item["action"]
+                            label = SCHEME_ACTION_LABELS.get(action, action)
+                            with get_conn() as conn:
+                                exists = get_review_scheme_by_name(conn, original_name)
+                            status_badge = "✅ 已入库" if exists else "🆕 未入库"
+                            conflict = "⚠️ 冲突" if exists and action != SCHEME_ACTION_CREATED else "—"
+                            result_map = {
+                                SCHEME_ACTION_CREATED: "→ 新建入库",
+                                SCHEME_ACTION_OVERWRITTEN: "→ 覆盖已有",
+                                SCHEME_ACTION_RENAMED: f"→ 改名导入为 '{target_name}'",
+                                SCHEME_ACTION_KEPT: "→ 保留原方案（跳过）",
+                            }
+                            outcome = result_map.get(action, "—")
+                            st.markdown(
+                                f"**[{i+1}] '{original_name}'**  |  DB状态: {status_badge}  |  "
+                                f"冲突: {conflict}  |  预检结果: **{label}** {outcome}"
+                            )
+                        st.divider()
+                        st.markdown(f"**汇总：** 方案总数 {summary['scheme_count']}，"
+                                    f"新建🆕 {summary['created_count']}，"
+                                    f"覆盖♻️ {summary['overwritten_count']}，"
+                                    f"改名✏️ {summary['renamed_count']}，"
+                                    f"保留跳过⏭️ {summary['kept_count']}")
+
                     st.markdown("**勾选本次要导入的方案（未勾选的留在待处理批次）：**")
 
                     selected_indices = st.session_state.get("selected_indices",
@@ -1437,6 +1546,7 @@ with tab6:
                                     conn, preview_result, all_indices, item_decisions
                                 )
                             if result["success"]:
+                                processed = result.get("processed_indices", all_indices)
                                 st.success(
                                     f"✅ 导入完成！成功 {result['imported_count']} 个，"
                                     f"跳过 {result['skipped_count']} 个，共 {result['total']} 个"
@@ -1451,7 +1561,17 @@ with tab6:
                                 with get_conn() as conn:
                                     clear_import_preview_context(conn)
                                     if batch_id:
-                                        mark_batch_completed(conn, batch_id)
+                                        shrink_result = shrink_batch_to_remaining(
+                                            conn, batch_id, processed,
+                                            conflict_policy=result.get("conflict_policy"),
+                                            rename_suffix=result.get("rename_suffix_global"),
+                                        )
+                                        if not shrink_result.get("success"):
+                                            st.warning(
+                                                f"批次收口异常: {shrink_result.get('error','')}，"
+                                                f"将手动标记完成"
+                                            )
+                                            mark_batch_completed(conn, batch_id)
                                 for k in ["parsed_pkg", "preview_result", "selected_policy",
                                           "rename_suffix", "batch_id", "selected_indices",
                                           "item_decisions"]:
@@ -1466,49 +1586,18 @@ with tab6:
                             if not new_selected:
                                 st.warning("请至少勾选一个方案")
                             else:
+                                shrink_result = None
                                 with get_conn() as conn:
                                     result = confirm_partial_scheme_import(
                                         conn, preview_result, new_selected, new_decisions
                                     )
                                 if result["success"]:
+                                    processed = result.get("processed_indices", list(new_selected))
                                     remaining_count = result.get("remaining_count", 0)
                                     st.success(
                                         f"✅ 已导入 {result['imported_count']} 个方案，"
                                         f"跳过 {result['skipped_count']} 个"
                                     )
-                                    if remaining_count > 0:
-                                        st.info(
-                                            f"📋 还有 {remaining_count} 个方案留在待处理批次中，"
-                                            f"下次可继续导入"
-                                        )
-                                        remaining_pkg = {
-                                            "version": "1.0",
-                                            "exported_at": now_iso(),
-                                            "scheme_count": remaining_count,
-                                            "schemes": [],
-                                        }
-                                        for ri in result.get("remaining_items", []):
-                                            oname = ri.get("original_name", ri["name"])
-                                            found = None
-                                            for ps in pkg_schemes:
-                                                if ps["name"] == oname:
-                                                    found = ps
-                                                    break
-                                            if found:
-                                                remaining_pkg["schemes"].append(found)
-
-                                        new_batch_id = str(uuid.uuid4())
-                                        with get_conn() as conn:
-                                            remaining_preview = preview_scheme_package_import(
-                                                conn, remaining_pkg,
-                                                conflict_policy=selected_policy,
-                                                rename_suffix=rename_suffix,
-                                            )
-                                            save_import_batch(
-                                                conn, new_batch_id, remaining_pkg, remaining_preview,
-                                            )
-                                        st.session_state.batch_id = new_batch_id
-
                                     for r in result["results"]:
                                         lbl = SCHEME_ACTION_LABELS.get(r["action"], r["action"])
                                         emj = emoji_map.get(r["action"], "📦")
@@ -1517,14 +1606,44 @@ with tab6:
                                         else:
                                             st.info(f"{emj} '{r['name']}' ({lbl})")
 
+                                    if batch_id:
+                                        with get_conn() as conn:
+                                            shrink_result = shrink_batch_to_remaining(
+                                                conn, batch_id, processed,
+                                                conflict_policy=result.get("conflict_policy"),
+                                                rename_suffix=result.get("rename_suffix_global"),
+                                            )
+                                        if shrink_result and shrink_result.get("success"):
+                                            if shrink_result.get("all_completed"):
+                                                st.success("✅ 本批次所有方案已全部处理完成，批次已收口")
+                                            else:
+                                                st.info(
+                                                    f"📋 还有 {shrink_result['remaining_count']} 个方案留在待处理批次中，"
+                                                    f"新批次ID: {shrink_result['new_batch_id'][:16]}...，"
+                                                    f"下次打开应用会自动恢复。"
+                                                )
+                                                new_remain_dec = shrink_result.get("remaining_item_decisions", {})
+                                                new_remain_sel = shrink_result.get("remaining_selected_indices", [])
+                                                if new_remain_dec or new_remain_sel:
+                                                    st.caption(
+                                                        f"已保留: {len(new_remain_sel)} 项勾选，"
+                                                        f"{len(new_remain_dec)} 项决策/备注"
+                                                    )
+                                        elif shrink_result and not shrink_result.get("success"):
+                                            st.error(
+                                                f"批次收口失败: {shrink_result.get('error','未知错误')}，"
+                                                f"将改用兼容方式手动重建剩余批次"
+                                            )
+
                                     with get_conn() as conn:
                                         clear_import_preview_context(conn)
-                                        if batch_id and remaining_count == 0:
-                                            mark_batch_completed(conn, batch_id)
+
                                     for k in ["parsed_pkg", "preview_result", "selected_policy",
                                               "rename_suffix", "selected_indices", "item_decisions"]:
                                         if k in st.session_state:
                                             del st.session_state[k]
+                                    if "batch_id" in st.session_state:
+                                        del st.session_state["batch_id"]
                                     if remaining_count > 0:
                                         st.rerun()
                                 else:
@@ -1549,21 +1668,80 @@ with tab6:
                             st.success("✅ 已取消导入，数据库未做任何修改。勾选状态已保存到待处理批次。")
                             st.rerun()
 
-    with st.expander("📜 操作日志（最近50条）", expanded=False):
-        if operation_logs:
-            log_df = pd.DataFrame(operation_logs)
+    with st.expander("📜 导入决策日志与操作日志（可查询筛选）", expanded=False):
+        st.markdown("**导入决策日志查询（保留/覆盖/改名等决策均可查）**")
+        log_col1, log_col2, log_col3 = st.columns(3)
+        with log_col1:
+            log_scheme_name = st.text_input(
+                "按方案名搜索",
+                value="",
+                key="log_scheme_name_filter",
+                placeholder="输入方案名关键词，如：存在冲突A"
+            )
+        with log_col2:
+            log_type_choices = [
+                ("全部（含批次操作）", "import_scheme,import_scheme_note,batch_shrink,batch_create_remaining,batch_close,create,update,rename,copy,delete,load,export_scheme"),
+                ("仅导入决策（保留/覆盖/改名/新建）", "import_scheme"),
+                ("仅导入备注", "import_scheme_note"),
+                ("导入决策+备注", "import_scheme,import_scheme_note"),
+                ("仅批次收口/拆分操作", "batch_shrink,batch_create_remaining,batch_close"),
+                ("仅方案管理操作（新建/更新/改名/复制/删除）", "create,update,rename,copy,delete"),
+            ]
+            log_type_labels = [c[0] for c in log_type_choices]
+            log_type_values = [c[1] for c in log_type_choices]
+            log_type_choice = st.selectbox(
+                "日志类型",
+                range(len(log_type_choices)),
+                format_func=lambda i: log_type_labels[i],
+                index=2,
+                key="log_type_filter",
+            )
+            selected_log_type = log_type_values[log_type_choice]
+        with log_col3:
+            log_limit = st.number_input(
+                "返回条数",
+                min_value=10, max_value=1000, value=100, step=50,
+                key="log_limit_filter"
+            )
+
+        with get_conn() as conn:
+            filtered_logs = get_import_decision_logs(
+                conn,
+                scheme_name=log_scheme_name or None,
+                operation_type=selected_log_type,
+                limit=int(log_limit),
+            )
+
+        if filtered_logs:
+            log_df = pd.DataFrame(filtered_logs)
             log_df = log_df[["operated_at", "scheme_name", "operation_type", "operation_detail", "operator"]]
             log_df.columns = ["操作时间", "方案名称", "操作类型", "操作详情", "操作人"]
             log_df["操作时间"] = log_df["操作时间"].str[:19]
             type_labels = {
-                "create": "新建", "update": "更新", "rename": "改名",
-                "copy": "复制", "delete": "删除", "load": "载入",
-                "export": "导出", "export_scheme": "导出方案包",
-                "import_scheme": "导入方案包",
+                "create": "新建方案", "update": "更新方案", "rename": "改名方案",
+                "copy": "复制方案", "delete": "删除方案", "load": "载入方案",
+                "export_scheme": "导出方案包",
+                "import_scheme": "导入决策",
                 "import_scheme_note": "导入备注",
+                "batch_shrink": "批次收口",
+                "batch_create_remaining": "分出剩余批次",
+                "batch_close": "批次完成关闭",
             }
             log_df["操作类型"] = log_df["操作类型"].map(type_labels).fillna(log_df["操作类型"])
             st.dataframe(log_df, use_container_width=True, hide_index=True)
+            st.caption(f"匹配 {len(filtered_logs)} 条日志")
+        else:
+            st.info("暂无匹配的日志记录")
+
+        st.divider()
+        st.markdown("**全部操作日志（最近50条原始记录）**")
+        if operation_logs:
+            log_all_df = pd.DataFrame(operation_logs)
+            log_all_df = log_all_df[["operated_at", "scheme_name", "operation_type", "operation_detail", "operator"]]
+            log_all_df.columns = ["操作时间", "方案名称", "操作类型", "操作详情", "操作人"]
+            log_all_df["操作时间"] = log_all_df["操作时间"].str[:19]
+            log_all_df["操作类型"] = log_all_df["操作类型"].map(type_labels).fillna(log_all_df["操作类型"])
+            st.dataframe(log_all_df, use_container_width=True, hide_index=True)
         else:
             st.info("暂无操作日志")
 

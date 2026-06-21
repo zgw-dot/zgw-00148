@@ -4,6 +4,7 @@ import json
 import io
 import os
 import tempfile
+import uuid
 
 from db import (
     init_db, get_conn, STATUS_LABELS, STATUS_PENDING_REVIEW, STATUS_CONFIRMED,
@@ -25,6 +26,10 @@ from db import (
     load_last_import_policy, clear_import_preview_context,
     SCHEME_ACTION_LABELS, SCHEME_ACTION_CREATED, SCHEME_ACTION_OVERWRITTEN,
     SCHEME_ACTION_RENAMED, SCHEME_ACTION_KEPT,
+    compute_scheme_diff, save_import_batch, load_import_batch,
+    list_pending_batches, update_batch_selection, clear_import_batch,
+    mark_batch_completed, confirm_partial_scheme_import,
+    export_scheme_manifest,
 )
 from import_service import import_csv
 from engine import run_attribution, CAUSE_LABELS
@@ -991,36 +996,124 @@ with tab6:
         with get_conn() as conn:
             exportable_schemes = get_review_schemes(conn)
         if exportable_schemes:
-            export_scope = st.radio(
-                "导出范围",
-                ["当前方案", "全部方案"],
+            export_mode = st.radio(
+                "导出模式",
+                ["快速导出", "清单导出（支持筛选）"],
                 horizontal=True,
-                key="export_scheme_scope",
+                key="export_scheme_mode",
             )
-            export_scheme_ids = None
-            if export_scope == "当前方案":
-                cid = st.session_state.get("current_scheme_id")
-                if cid:
-                    export_scheme_ids = [cid]
-                else:
-                    st.warning("当前未选择方案，请先选择或载入一个方案")
-            if export_scope == "全部方案" or (export_scope == "当前方案" and export_scheme_ids):
-                with get_conn() as conn:
-                    pkg = export_scheme_package(conn, scheme_ids=export_scheme_ids)
-                pkg_json = json.dumps(pkg, ensure_ascii=False, indent=2, default=str)
-                scope_label = export_scope
-                if export_scope == "当前方案":
-                    scope_label = st.session_state.get("current_scheme_name", "当前方案")
-                pkg_file_name = f"scheme_package_{scope_label}_{now_iso()[:10]}.json"
-                pkg_file_name = pkg_file_name.replace(" ", "_").replace("/", "_")
-                st.download_button(
-                    "⬇️ 下载方案包 JSON",
-                    data=pkg_json.encode("utf-8"),
-                    file_name=pkg_file_name,
-                    mime="application/json",
-                    key="download_scheme_package",
+
+            if export_mode == "快速导出":
+                export_scope = st.radio(
+                    "导出范围",
+                    ["当前方案", "全部方案"],
+                    horizontal=True,
+                    key="export_scheme_scope",
                 )
-                st.caption(f"包含 {pkg['scheme_count']} 个方案，导出时间: {pkg['exported_at'][:19]}")
+                export_scheme_ids = None
+                if export_scope == "当前方案":
+                    cid = st.session_state.get("current_scheme_id")
+                    if cid:
+                        export_scheme_ids = [cid]
+                    else:
+                        st.warning("当前未选择方案，请先选择或载入一个方案")
+                if export_scope == "全部方案" or (export_scope == "当前方案" and export_scheme_ids):
+                    with get_conn() as conn:
+                        pkg = export_scheme_package(conn, scheme_ids=export_scheme_ids)
+                    pkg_json = json.dumps(pkg, ensure_ascii=False, indent=2, default=str)
+                    scope_label = export_scope
+                    if export_scope == "当前方案":
+                        scope_label = st.session_state.get("current_scheme_name", "当前方案")
+                    pkg_file_name = f"scheme_package_{scope_label}_{now_iso()[:10]}.json"
+                    pkg_file_name = pkg_file_name.replace(" ", "_").replace("/", "_")
+                    st.download_button(
+                        "⬇️ 下载方案包 JSON",
+                        data=pkg_json.encode("utf-8"),
+                        file_name=pkg_file_name,
+                        mime="application/json",
+                        key="download_scheme_package",
+                    )
+                    st.caption(f"包含 {pkg['scheme_count']} 个方案，导出时间: {pkg['exported_at'][:19]}")
+            else:
+                st.markdown("筛选条件")
+                manifest_name_filter = st.text_input(
+                    "方案名包含",
+                    value="",
+                    key="manifest_name_filter",
+                )
+                manifest_updated_after = st.text_input(
+                    "更新时间晚于（如 2026-01-01）",
+                    value="",
+                    key="manifest_updated_after",
+                )
+                scheme_opts = [(s["id"], s["name"]) for s in exportable_schemes]
+                selected_export_names = st.multiselect(
+                    "选择要导出的方案",
+                    options=[s[1] for s in scheme_opts],
+                    default=[s[1] for s in scheme_opts],
+                    key="manifest_scheme_select",
+                )
+                export_scheme_ids = [
+                    s[0] for s in scheme_opts if s[1] in selected_export_names
+                ]
+
+                if export_scheme_ids:
+                    with get_conn() as conn:
+                        manifest = export_scheme_manifest(
+                            conn,
+                            scheme_ids=export_scheme_ids,
+                            name_filter=manifest_name_filter or None,
+                            updated_after=manifest_updated_after or None,
+                        )
+                    manifest_json = json.dumps(manifest, ensure_ascii=False, indent=2, default=str)
+                    pkg_file_name = f"scheme_manifest_{now_iso()[:10]}.json"
+                    st.download_button(
+                        "⬇️ 下载导出清单 JSON",
+                        data=manifest_json.encode("utf-8"),
+                        file_name=pkg_file_name,
+                        mime="application/json",
+                        key="download_scheme_manifest",
+                    )
+                    st.caption(
+                        f"清单包含 {manifest['total_schemes']} 个方案，"
+                        f"导出时间: {manifest['exported_at'][:19]}"
+                    )
+                    with st.expander("清单摘要", expanded=False):
+                        st.json({
+                            "total_schemes": manifest["total_schemes"],
+                            "date_range": manifest["date_range"],
+                            "filter_applied": manifest["filter_applied"],
+                        })
+
+                    export_pkg_data = None
+                    if manifest["schemes"]:
+                        pkg_schemes = []
+                        for s in manifest["schemes"]:
+                            pkg_schemes.append({
+                                "name": s["name"],
+                                "description": s.get("description"),
+                                "filter_state": s["filter_state"],
+                                "data_date_range": s.get("data_date_range"),
+                                "created_at": s.get("created_at"),
+                                "updated_at": s.get("updated_at"),
+                            })
+                        export_pkg = {
+                            "version": "1.0",
+                            "exported_at": manifest["exported_at"],
+                            "scheme_count": len(pkg_schemes),
+                            "schemes": pkg_schemes,
+                        }
+                        export_pkg_json = json.dumps(export_pkg, ensure_ascii=False, indent=2, default=str)
+                        pkg_file_name2 = f"scheme_package_filtered_{now_iso()[:10]}.json"
+                        st.download_button(
+                            "⬇️ 同时下载可导入的方案包 JSON",
+                            data=export_pkg_json.encode("utf-8"),
+                            file_name=pkg_file_name2,
+                            mime="application/json",
+                            key="download_scheme_package_filtered",
+                        )
+                else:
+                    st.info("请至少选择一个方案")
         else:
             st.info("暂无方案可导出")
 
@@ -1030,13 +1123,47 @@ with tab6:
         with get_conn() as conn:
             saved_preview = load_import_preview_context(conn)
             last_policy = load_last_import_policy(conn)
+            pending_batches = list_pending_batches(conn)
+
+        if pending_batches:
+            st.warning(f"📋 有 {len(pending_batches)} 个待处理批次")
+            batch_options = [
+                f"{b['batch_id'][:8]}... ({b['scheme_count']}个方案, {b['created_at'][:19]})"
+                for b in pending_batches
+            ]
+            batch_options.append("（不恢复）")
+            selected_batch_idx = st.selectbox(
+                "恢复待处理批次",
+                range(len(batch_options)),
+                format_func=lambda i: batch_options[i],
+                key="select_pending_batch",
+            )
+            if selected_batch_idx < len(pending_batches):
+                if st.button("📂 恢复此批次", key="restore_batch_btn"):
+                    batch = load_import_batch(conn, pending_batches[selected_batch_idx]["batch_id"])
+                    if batch:
+                        st.session_state.parsed_pkg = batch["package"]
+                        st.session_state.preview_result = batch["preview"]
+                        st.session_state.batch_id = batch["batch_id"]
+                        st.session_state.selected_indices = batch.get("selected_indices", [])
+                        st.session_state.item_decisions = batch.get("item_decisions", {})
+                        st.rerun()
+            if st.button("🗑️ 清除所有待处理批次", key="clear_all_batches"):
+                with get_conn() as conn:
+                    for b in pending_batches:
+                        clear_import_batch(conn, b["batch_id"])
+                if "batch_id" in st.session_state:
+                    del st.session_state["batch_id"]
+                st.rerun()
+            st.divider()
 
         if saved_preview and saved_preview.get("success"):
             st.info("💡 检测到未完成的导入预览，已自动恢复")
             if st.button("🔄 清除预览，重新上传", key="clear_saved_preview"):
                 with get_conn() as conn:
                     clear_import_preview_context(conn)
-                for k in ["parsed_pkg", "preview_result", "selected_policy", "rename_suffix"]:
+                for k in ["parsed_pkg", "preview_result", "selected_policy", "rename_suffix",
+                          "batch_id", "selected_indices", "item_decisions"]:
                     if k in st.session_state:
                         del st.session_state[k]
                 st.rerun()
@@ -1052,8 +1179,9 @@ with tab6:
 
         parsed_pkg = st.session_state.get("parsed_pkg")
         preview_result = st.session_state.get("preview_result")
+        batch_id = st.session_state.get("batch_id")
 
-        if saved_preview and not parsed_pkg:
+        if saved_preview and not parsed_pkg and not batch_id:
             parsed_pkg = saved_preview.get("package")
             preview_result = saved_preview
             st.session_state.parsed_pkg = parsed_pkg
@@ -1143,8 +1271,19 @@ with tab6:
                         st.error("❌ 预检异常：预检阶段留下了操作日志，请联系开发人员")
                     elif preview_result["success"]:
                         st.session_state.preview_result = preview_result
+                        st.session_state.batch_id = str(uuid.uuid4())
+                        st.session_state.selected_indices = list(range(len(preview_result["preview_results"])))
+                        st.session_state.item_decisions = {}
                         with get_conn() as conn:
                             save_import_preview_context(conn, preview_result)
+                            save_import_batch(
+                                conn,
+                                st.session_state.batch_id,
+                                parsed_pkg,
+                                preview_result,
+                                selected_indices=st.session_state.selected_indices,
+                                item_decisions=st.session_state.item_decisions,
+                            )
                         st.success("✅ 预检完成，以下是导入预览（未写入数据库）")
                     else:
                         st.error(f"❌ 预检失败: {preview_result.get('error', '未知错误')}")
@@ -1152,6 +1291,7 @@ with tab6:
                 if preview_result and preview_result.get("success"):
                     summary = preview_result["summary"]
                     preview_items = preview_result["preview_results"]
+                    pkg_schemes = preview_result.get("package", {}).get("schemes", [])
 
                     st.subheader("📋 导入预览")
 
@@ -1178,100 +1318,235 @@ with tab6:
                         if summary.get("min_date") and summary.get("max_date"):
                             st.caption(f"📊 数据时间范围: {summary['min_date'][:10]} ~ {summary['max_date'][:10]}")
 
-                    st.markdown("**各方案处理详情：**")
-                    for item in preview_items:
+                    st.markdown("**勾选本次要导入的方案（未勾选的留在待处理批次）：**")
+
+                    selected_indices = st.session_state.get("selected_indices",
+                                                           list(range(len(preview_items))))
+                    item_decisions = st.session_state.get("item_decisions", {})
+
+                    new_selected = []
+                    new_decisions = dict(item_decisions)
+
+                    emoji_map = {
+                        SCHEME_ACTION_CREATED: "🆕",
+                        SCHEME_ACTION_OVERWRITTEN: "♻️",
+                        SCHEME_ACTION_RENAMED: "✏️",
+                        SCHEME_ACTION_KEPT: "⏭️",
+                    }
+
+                    for i, item in enumerate(preview_items):
                         action = item["action"]
                         label = SCHEME_ACTION_LABELS.get(action, action)
                         name = item["name"]
                         original_name = item.get("original_name", name)
-
-                        emoji_map = {
-                            SCHEME_ACTION_CREATED: "🆕",
-                            SCHEME_ACTION_OVERWRITTEN: "♻️",
-                            SCHEME_ACTION_RENAMED: "✏️",
-                            SCHEME_ACTION_KEPT: "⏭️",
-                        }
                         emoji = emoji_map.get(action, "📦")
 
-                        if action == SCHEME_ACTION_RENAMED:
-                            st.info(f"{emoji} '{original_name}' → '{name}' ({label})")
-                        elif action == SCHEME_ACTION_KEPT:
-                            reason = item.get("reason", label)
-                            st.info(f"{emoji} '{name}' ({label}) - {reason}")
-                        elif action == SCHEME_ACTION_OVERWRITTEN:
-                            exist_desc = item.get("existing_description", "(无描述)")
-                            new_desc = item.get("description", "(无描述)")
-                            st.info(f"{emoji} '{name}' ({label})" +
-                                    (f"\n   原描述: {exist_desc} → 新描述: {new_desc}" if exist_desc != new_desc else ""))
-                        else:
-                            desc = item.get("description", "")
-                            st.info(f"{emoji} '{name}' ({label})" + (f" - {desc}" if desc else ""))
+                        incoming_scheme = pkg_schemes[i] if i < len(pkg_schemes) else {}
+                        with get_conn() as conn:
+                            local_scheme = get_review_scheme_by_name(conn, original_name)
+                        diffs = compute_scheme_diff(local_scheme, incoming_scheme)
 
-                    col_confirm, col_cancel = st.columns(2)
-                    with col_confirm:
-                        if st.button("✅ 确认导入", type="primary", key="confirm_import_scheme"):
-                            with get_conn() as conn:
-                                result = confirm_scheme_package_import(conn, preview_result)
-                            if result["success"]:
-                                actual_created = sum(
-                                    1 for r in result["results"] if r["action"] == SCHEME_ACTION_CREATED
-                                )
-                                actual_overwritten = sum(
-                                    1 for r in result["results"] if r["action"] == SCHEME_ACTION_OVERWRITTEN
-                                )
-                                actual_renamed = sum(
-                                    1 for r in result["results"] if r["action"] == SCHEME_ACTION_RENAMED
-                                )
-                                actual_kept = sum(
-                                    1 for r in result["results"] if r["action"] == SCHEME_ACTION_KEPT
-                                )
+                        checked = i in selected_indices
+                        col_check, col_detail = st.columns([1, 5])
+                        with col_check:
+                            is_selected = st.checkbox(
+                                f"导入",
+                                value=checked,
+                                key=f"import_select_{i}",
+                            )
+                        with col_detail:
+                            header = f"{emoji} '{original_name}'"
+                            if action == SCHEME_ACTION_RENAMED:
+                                header += f" → '{name}'"
+                            header += f" （{label}）"
+                            st.markdown(f"**{header}**")
 
-                                preview_ok = (
-                                    actual_created == summary["created_count"] and
-                                    actual_overwritten == summary["overwritten_count"] and
-                                    actual_renamed == summary["renamed_count"] and
-                                    actual_kept == summary["kept_count"]
-                                )
+                            if diffs:
+                                diff_rows = []
+                                for d in diffs:
+                                    diff_rows.append(f"| {d['field']} | {d['local']} | {d['incoming']} |")
+                                diff_table = "| 差异项 | 本地 | 待导入 |\n|---|---|---|\n" + "\n".join(diff_rows)
+                                st.markdown(diff_table)
+                            elif local_scheme:
+                                st.caption("✅ 与本地版本一致，无差异")
+                            else:
+                                st.caption("🆕 本地不存在此方案")
 
-                                if not preview_ok:
-                                    st.warning(
-                                        "⚠️ 注意：实际导入结果与预览有差异，"
-                                        "可能是预检后其他操作修改了数据库"
+                            if action in (SCHEME_ACTION_OVERWRITTEN, SCHEME_ACTION_KEPT, SCHEME_ACTION_RENAMED):
+                                per_action_options = ["默认（跟随全局策略）", "保留原方案", "覆盖已有方案", "改名导入"]
+                                per_action_values = [None, "kept", "overwritten", "renamed"]
+                                current_per = new_decisions.get(str(i), {}).get("action")
+                                per_idx = 0
+                                if current_per in per_action_values:
+                                    per_idx = per_action_values.index(current_per)
+                                per_choice = st.selectbox(
+                                    "冲突处理",
+                                    per_action_options,
+                                    index=per_idx,
+                                    key=f"per_action_{i}",
+                                )
+                                chosen_action = per_action_values[per_action_options.index(per_choice)]
+
+                                rename_suffix_val = rename_suffix
+                                if chosen_action == "renamed":
+                                    rename_suffix_val = st.text_input(
+                                        "改名后缀",
+                                        value=new_decisions.get(str(i), {}).get("rename_suffix", rename_suffix),
+                                        key=f"per_rename_{i}",
                                     )
 
+                                note = st.text_input(
+                                    "备注",
+                                    value=new_decisions.get(str(i), {}).get("note", ""),
+                                    key=f"per_note_{i}",
+                                )
+
+                                dec = {}
+                                if chosen_action:
+                                    dec["action"] = chosen_action
+                                if chosen_action == "renamed":
+                                    dec["rename_suffix"] = rename_suffix_val
+                                if note:
+                                    dec["note"] = note
+                                new_decisions[str(i)] = dec
+                            else:
+                                note = st.text_input(
+                                    "备注",
+                                    value=new_decisions.get(str(i), {}).get("note", ""),
+                                    key=f"per_note_{i}",
+                                )
+                                if note:
+                                    new_decisions[str(i)] = {"note": note}
+
+                        if is_selected:
+                            new_selected.append(i)
+
+                    st.session_state.selected_indices = new_selected
+                    st.session_state.item_decisions = new_decisions
+
+                    if batch_id:
+                        with get_conn() as conn:
+                            update_batch_selection(conn, batch_id, new_selected, new_decisions)
+
+                    col_confirm, col_partial, col_cancel = st.columns(3)
+                    with col_confirm:
+                        if st.button("✅ 全部确认导入", type="primary", key="confirm_import_scheme"):
+                            all_indices = list(range(len(preview_items)))
+                            with get_conn() as conn:
+                                result = confirm_partial_scheme_import(
+                                    conn, preview_result, all_indices, item_decisions
+                                )
+                            if result["success"]:
                                 st.success(
                                     f"✅ 导入完成！成功 {result['imported_count']} 个，"
                                     f"跳过 {result['skipped_count']} 个，共 {result['total']} 个"
                                 )
                                 for r in result["results"]:
-                                    label = SCHEME_ACTION_LABELS.get(r["action"], r["action"])
-                                    emoji = emoji_map.get(r["action"], "📦")
+                                    lbl = SCHEME_ACTION_LABELS.get(r["action"], r["action"])
+                                    emj = emoji_map.get(r["action"], "📦")
                                     if r["action"] == SCHEME_ACTION_RENAMED:
-                                        st.info(f"{emoji} '{r.get('original_name', r['name'])}' → '{r['name']}' ({label})")
-                                    elif r["action"] == SCHEME_ACTION_KEPT:
-                                        st.info(f"{emoji} '{r['name']}' ({label})")
+                                        st.info(f"{emj} '{r.get('original_name', r['name'])}' → '{r['name']}' ({lbl})")
                                     else:
-                                        st.info(f"{emoji} '{r['name']}' ({label})")
-
-                                for k in ["parsed_pkg", "preview_result", "selected_policy", "rename_suffix"]:
+                                        st.info(f"{emj} '{r['name']}' ({lbl})")
+                                with get_conn() as conn:
+                                    clear_import_preview_context(conn)
+                                    if batch_id:
+                                        mark_batch_completed(conn, batch_id)
+                                for k in ["parsed_pkg", "preview_result", "selected_policy",
+                                          "rename_suffix", "batch_id", "selected_indices",
+                                          "item_decisions"]:
                                     if k in st.session_state:
                                         del st.session_state[k]
                                 st.rerun()
                             else:
                                 st.error(f"❌ 导入失败: {result['error']}")
 
+                    with col_partial:
+                        if st.button("☑️ 导入选中项", type="secondary", key="partial_import_scheme"):
+                            if not new_selected:
+                                st.warning("请至少勾选一个方案")
+                            else:
+                                with get_conn() as conn:
+                                    result = confirm_partial_scheme_import(
+                                        conn, preview_result, new_selected, new_decisions
+                                    )
+                                if result["success"]:
+                                    remaining_count = result.get("remaining_count", 0)
+                                    st.success(
+                                        f"✅ 已导入 {result['imported_count']} 个方案，"
+                                        f"跳过 {result['skipped_count']} 个"
+                                    )
+                                    if remaining_count > 0:
+                                        st.info(
+                                            f"📋 还有 {remaining_count} 个方案留在待处理批次中，"
+                                            f"下次可继续导入"
+                                        )
+                                        remaining_pkg = {
+                                            "version": "1.0",
+                                            "exported_at": now_iso(),
+                                            "scheme_count": remaining_count,
+                                            "schemes": [],
+                                        }
+                                        for ri in result.get("remaining_items", []):
+                                            oname = ri.get("original_name", ri["name"])
+                                            found = None
+                                            for ps in pkg_schemes:
+                                                if ps["name"] == oname:
+                                                    found = ps
+                                                    break
+                                            if found:
+                                                remaining_pkg["schemes"].append(found)
+
+                                        new_batch_id = str(uuid.uuid4())
+                                        with get_conn() as conn:
+                                            remaining_preview = preview_scheme_package_import(
+                                                conn, remaining_pkg,
+                                                conflict_policy=selected_policy,
+                                                rename_suffix=rename_suffix,
+                                            )
+                                            save_import_batch(
+                                                conn, new_batch_id, remaining_pkg, remaining_preview,
+                                            )
+                                        st.session_state.batch_id = new_batch_id
+
+                                    for r in result["results"]:
+                                        lbl = SCHEME_ACTION_LABELS.get(r["action"], r["action"])
+                                        emj = emoji_map.get(r["action"], "📦")
+                                        if r["action"] == SCHEME_ACTION_RENAMED:
+                                            st.info(f"{emj} '{r.get('original_name', r['name'])}' → '{r['name']}' ({lbl})")
+                                        else:
+                                            st.info(f"{emj} '{r['name']}' ({lbl})")
+
+                                    with get_conn() as conn:
+                                        clear_import_preview_context(conn)
+                                        if batch_id and remaining_count == 0:
+                                            mark_batch_completed(conn, batch_id)
+                                    for k in ["parsed_pkg", "preview_result", "selected_policy",
+                                              "rename_suffix", "selected_indices", "item_decisions"]:
+                                        if k in st.session_state:
+                                            del st.session_state[k]
+                                    if remaining_count > 0:
+                                        st.rerun()
+                                else:
+                                    st.error(f"❌ 导入失败: {result['error']}")
+
                     with col_cancel:
                         if st.button("❌ 取消导入", key="cancel_import_scheme"):
                             with get_conn() as conn:
-                                after_cancel_schemes = get_review_schemes(conn)
-                                after_cancel_count = len(after_cancel_schemes)
                                 clear_import_preview_context(conn)
+                                if batch_id:
+                                    update_batch_selection(
+                                        conn, batch_id,
+                                        st.session_state.get("selected_indices", []),
+                                        st.session_state.get("item_decisions", {}),
+                                    )
 
-                            for k in ["parsed_pkg", "preview_result", "selected_policy", "rename_suffix"]:
+                            for k in ["parsed_pkg", "preview_result", "selected_policy",
+                                      "rename_suffix", "selected_indices", "item_decisions"]:
                                 if k in st.session_state:
                                     del st.session_state[k]
 
-                            st.success("✅ 已取消导入，数据库未做任何修改")
+                            st.success("✅ 已取消导入，数据库未做任何修改。勾选状态已保存到待处理批次。")
                             st.rerun()
 
     with st.expander("📜 操作日志（最近50条）", expanded=False):
@@ -1285,6 +1560,7 @@ with tab6:
                 "copy": "复制", "delete": "删除", "load": "载入",
                 "export": "导出", "export_scheme": "导出方案包",
                 "import_scheme": "导入方案包",
+                "import_scheme_note": "导入备注",
             }
             log_df["操作类型"] = log_df["操作类型"].map(type_labels).fillna(log_df["操作类型"])
             st.dataframe(log_df, use_container_width=True, hide_index=True)

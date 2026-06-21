@@ -1,6 +1,7 @@
 import sqlite3
 import json
 import os
+import uuid
 from datetime import datetime
 from contextlib import contextmanager
 
@@ -157,6 +158,18 @@ CREATE TABLE IF NOT EXISTS review_scheme_operations (
     operator TEXT DEFAULT 'user',
     FOREIGN KEY (scheme_id) REFERENCES review_schemes(id)
 );
+
+CREATE TABLE IF NOT EXISTS scheme_import_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id TEXT NOT NULL UNIQUE,
+    package_json TEXT NOT NULL,
+    preview_json TEXT NOT NULL,
+    selected_indices_json TEXT NOT NULL DEFAULT '[]',
+    item_decisions_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 STATUS_PENDING_REVIEW = "pending_review"
@@ -305,6 +318,24 @@ def _migrate_db(conn):
                     conn.execute(f"ALTER TABLE {table_name} ADD COLUMN data_date_range_json TEXT")
                 if "last_used_at" not in col_names:
                     conn.execute(f"ALTER TABLE {table_name} ADD COLUMN last_used_at TEXT")
+
+    batch_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='scheme_import_batches'"
+    ).fetchone()
+    if not batch_exists:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS scheme_import_batches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id TEXT NOT NULL UNIQUE,
+                package_json TEXT NOT NULL,
+                preview_json TEXT NOT NULL,
+                selected_indices_json TEXT NOT NULL DEFAULT '[]',
+                item_decisions_json TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
 
 
 def now_iso():
@@ -1424,3 +1455,278 @@ def get_scheme_operation_logs(conn, scheme_id=None, limit=100):
     params.append(limit)
     rows = conn.execute(sql, params).fetchall()
     return [dict(r) for r in rows]
+
+
+def compute_scheme_diff(local_scheme, incoming_scheme):
+    diffs = []
+    if not local_scheme:
+        return diffs
+
+    local_fs = local_scheme.get("filter_state", {})
+    incoming_fs = incoming_scheme.get("filter_state", {})
+    fs_keys = set(list(local_fs.keys()) + list(incoming_fs.keys()))
+    for k in sorted(fs_keys):
+        lv = local_fs.get(k)
+        iv = incoming_fs.get(k)
+        if lv != iv:
+            diffs.append({
+                "field": f"筛选条件.{k}",
+                "local": str(lv) if lv is not None else "(空)",
+                "incoming": str(iv) if iv is not None else "(空)",
+            })
+
+    local_desc = local_scheme.get("description") or ""
+    incoming_desc = incoming_scheme.get("description") or ""
+    if local_desc != incoming_desc:
+        diffs.append({
+            "field": "描述",
+            "local": local_desc or "(空)",
+            "incoming": incoming_desc or "(空)",
+        })
+
+    local_dr = local_scheme.get("data_date_range") or {}
+    incoming_dr = incoming_scheme.get("data_date_range") or {}
+    for dk in ["min_date", "max_date"]:
+        lv = local_dr.get(dk, "")
+        iv = incoming_dr.get(dk, "")
+        if lv != iv:
+            label = "时间范围.起始" if dk == "min_date" else "时间范围.截止"
+            diffs.append({
+                "field": label,
+                "local": lv or "(空)",
+                "incoming": iv or "(空)",
+            })
+
+    return diffs
+
+
+def save_import_batch(conn, batch_id, package, preview, selected_indices=None, item_decisions=None):
+    now = now_iso()
+    pj = json.dumps(package, ensure_ascii=False)
+    prevj = json.dumps(preview, ensure_ascii=False)
+    sel = json.dumps(selected_indices if selected_indices is not None else [], ensure_ascii=False)
+    dec = json.dumps(item_decisions if item_decisions is not None else {}, ensure_ascii=False)
+
+    existing = conn.execute(
+        "SELECT id FROM scheme_import_batches WHERE batch_id = ?", (batch_id,)
+    ).fetchone()
+
+    if existing:
+        conn.execute(
+            """UPDATE scheme_import_batches
+               SET package_json = ?, preview_json = ?, selected_indices_json = ?,
+                   item_decisions_json = ?, status = 'pending', updated_at = ?
+               WHERE batch_id = ?""",
+            (pj, prevj, sel, dec, now, batch_id),
+        )
+    else:
+        conn.execute(
+            """INSERT INTO scheme_import_batches
+               (batch_id, package_json, preview_json, selected_indices_json,
+                item_decisions_json, status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)""",
+            (batch_id, pj, prevj, sel, dec, now, now),
+        )
+    return batch_id
+
+
+def load_import_batch(conn, batch_id):
+    row = conn.execute(
+        "SELECT * FROM scheme_import_batches WHERE batch_id = ?", (batch_id,)
+    ).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    return {
+        "batch_id": d["batch_id"],
+        "package": json.loads(d["package_json"]),
+        "preview": json.loads(d["preview_json"]),
+        "selected_indices": json.loads(d["selected_indices_json"]),
+        "item_decisions": json.loads(d["item_decisions_json"]),
+        "status": d["status"],
+        "created_at": d["created_at"],
+        "updated_at": d["updated_at"],
+    }
+
+
+def list_pending_batches(conn):
+    rows = conn.execute(
+        "SELECT * FROM scheme_import_batches WHERE status = 'pending' ORDER BY updated_at DESC"
+    ).fetchall()
+    results = []
+    for r in rows:
+        d = dict(r)
+        preview = json.loads(d["preview_json"])
+        summary = preview.get("summary", {})
+        results.append({
+            "batch_id": d["batch_id"],
+            "scheme_count": summary.get("scheme_count", 0),
+            "created_count": summary.get("created_count", 0),
+            "conflict_count": summary.get("overwritten_count", 0) + summary.get("renamed_count", 0) + summary.get("kept_count", 0),
+            "created_at": d["created_at"],
+            "updated_at": d["updated_at"],
+            "status": d["status"],
+        })
+    return results
+
+
+def update_batch_selection(conn, batch_id, selected_indices, item_decisions):
+    now = now_iso()
+    sel = json.dumps(selected_indices, ensure_ascii=False)
+    dec = json.dumps(item_decisions, ensure_ascii=False)
+    conn.execute(
+        """UPDATE scheme_import_batches
+           SET selected_indices_json = ?, item_decisions_json = ?, updated_at = ?
+           WHERE batch_id = ?""",
+        (sel, dec, now, batch_id),
+    )
+
+
+def clear_import_batch(conn, batch_id):
+    conn.execute("DELETE FROM scheme_import_batches WHERE batch_id = ?", (batch_id,))
+
+
+def mark_batch_completed(conn, batch_id):
+    now = now_iso()
+    conn.execute(
+        "UPDATE scheme_import_batches SET status = 'completed', updated_at = ? WHERE batch_id = ?",
+        (now, batch_id),
+    )
+
+
+def confirm_partial_scheme_import(conn, preview_context, selected_indices, item_decisions):
+    if not preview_context or not isinstance(preview_context, dict):
+        return {"success": False, "error": "没有可确认的导入预览"}
+
+    if not preview_context.get("success") or not preview_context.get("valid"):
+        return {"success": False, "error": "预览结果无效"}
+
+    preview_results = preview_context.get("preview_results", [])
+    if not preview_results:
+        return {"success": False, "error": "预览结果为空"}
+
+    if not selected_indices:
+        return {"success": False, "error": "未选择任何方案进行导入"}
+
+    selected_set = set(selected_indices)
+    items_to_import = []
+    for i, pr in enumerate(preview_results):
+        if i not in selected_set:
+            continue
+
+        decision = item_decisions.get(str(i), {}) if item_decisions else {}
+        override_action = decision.get("action")
+        note = decision.get("note", "")
+
+        item = dict(pr)
+        if override_action and override_action in (
+            SCHEME_ACTION_CREATED, SCHEME_ACTION_OVERWRITTEN,
+            SCHEME_ACTION_RENAMED, SCHEME_ACTION_KEPT
+        ):
+            original_name = pr.get("original_name", pr["name"])
+            if override_action == SCHEME_ACTION_RENAMED and pr["action"] != SCHEME_ACTION_RENAMED:
+                rename_suffix = decision.get("rename_suffix", "(导入)")
+                new_name = _compute_rename_target(conn, original_name, rename_suffix)
+                item["name"] = new_name
+            elif override_action == SCHEME_ACTION_OVERWRITTEN:
+                existing = conn.execute(
+                    "SELECT * FROM review_schemes WHERE name = ?", (original_name,)
+                ).fetchone()
+                if existing:
+                    item["existing_id"] = dict(existing)["id"]
+            item["action"] = override_action
+
+        item["note"] = note
+        items_to_import.append(item)
+
+    result = _execute_scheme_import(conn, items_to_import)
+
+    if result["success"]:
+        for r in result["results"]:
+            idx = None
+            for i, pr in enumerate(preview_results):
+                if i in selected_set and pr.get("original_name", pr["name"]) == r.get("original_name", r["name"]):
+                    idx = i
+                    break
+            if idx is not None:
+                decision = item_decisions.get(str(idx), {}) if item_decisions else {}
+                note = decision.get("note", "")
+                if note:
+                    log_scheme_operation(
+                        conn, r.get("scheme_id"), r["name"],
+                        "import_scheme_note",
+                        f"导入备注: {note}",
+                    )
+
+        remaining = [pr for i, pr in enumerate(preview_results) if i not in selected_set]
+        result["remaining_count"] = len(remaining)
+        result["remaining_items"] = remaining
+
+    return result
+
+
+def export_scheme_manifest(conn, scheme_ids=None, name_filter=None, updated_after=None):
+    now = now_iso()
+    if scheme_ids is not None:
+        placeholders = ",".join("?" for _ in scheme_ids)
+        rows = conn.execute(
+            f"SELECT * FROM review_schemes WHERE id IN ({placeholders})",
+            list(scheme_ids),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM review_schemes ORDER BY COALESCE(last_used_at, updated_at) DESC"
+        ).fetchall()
+
+    schemes = []
+    for r in rows:
+        d = dict(r)
+        if name_filter and name_filter.lower() not in d["name"].lower():
+            continue
+        if updated_after and d.get("updated_at", "") < updated_after:
+            continue
+        try:
+            filter_state = json.loads(d["filter_state_json"]) if d.get("filter_state_json") else {}
+        except (TypeError, json.JSONDecodeError):
+            filter_state = {}
+        try:
+            data_date_range = json.loads(d["data_date_range_json"]) if d.get("data_date_range_json") else None
+        except (TypeError, json.JSONDecodeError):
+            data_date_range = None
+        schemes.append({
+            "id": d["id"],
+            "name": d["name"],
+            "description": d.get("description"),
+            "filter_state": filter_state,
+            "data_date_range": data_date_range,
+            "created_at": d["created_at"],
+            "updated_at": d["updated_at"],
+            "last_used_at": d.get("last_used_at"),
+        })
+
+    date_ranges = []
+    for s in schemes:
+        dr = s.get("data_date_range")
+        if dr and isinstance(dr, dict):
+            if dr.get("min_date"):
+                date_ranges.append(dr["min_date"])
+            if dr.get("max_date"):
+                date_ranges.append(dr["max_date"])
+
+    manifest = {
+        "version": SCHEME_PACKAGE_VERSION,
+        "exported_at": now,
+        "type": "scheme_export_manifest",
+        "total_schemes": len(schemes),
+        "date_range": {
+            "min_date": min(date_ranges) if date_ranges else None,
+            "max_date": max(date_ranges) if date_ranges else None,
+        },
+        "filter_applied": {
+            "name_filter": name_filter,
+            "updated_after": updated_after,
+        },
+        "schemes": schemes,
+    }
+
+    return manifest

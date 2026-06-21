@@ -20,6 +20,11 @@ from db import (
     copy_review_scheme, mark_scheme_used, get_last_used_scheme,
     check_data_date_range_changed, get_scheme_operation_logs, log_scheme_operation,
     export_scheme_package, validate_scheme_package, import_scheme_package,
+    preview_scheme_package_import, confirm_scheme_package_import,
+    save_import_preview_context, load_import_preview_context,
+    load_last_import_policy, clear_import_preview_context,
+    SCHEME_ACTION_LABELS, SCHEME_ACTION_CREATED, SCHEME_ACTION_OVERWRITTEN,
+    SCHEME_ACTION_RENAMED, SCHEME_ACTION_KEPT,
 )
 from import_service import import_csv
 from engine import run_attribution, CAUSE_LABELS
@@ -1021,80 +1026,253 @@ with tab6:
 
     with pkg_col2:
         st.markdown("**导入方案包**")
+
+        with get_conn() as conn:
+            saved_preview = load_import_preview_context(conn)
+            last_policy = load_last_import_policy(conn)
+
+        if saved_preview and saved_preview.get("success"):
+            st.info("💡 检测到未完成的导入预览，已自动恢复")
+            if st.button("🔄 清除预览，重新上传", key="clear_saved_preview"):
+                with get_conn() as conn:
+                    clear_import_preview_context(conn)
+                for k in ["parsed_pkg", "preview_result", "selected_policy", "rename_suffix"]:
+                    if k in st.session_state:
+                        del st.session_state[k]
+                st.rerun()
+            st.divider()
+
+        default_policy = "keep"
+        default_suffix = "(导入)"
+        if last_policy:
+            default_policy = last_policy.get("conflict_policy", "keep")
+            default_suffix = last_policy.get("rename_suffix", "(导入)")
+
         uploaded_pkg = st.file_uploader("上传方案包 JSON 文件", type=["json"], key="upload_scheme_package")
-        if uploaded_pkg:
+
+        parsed_pkg = st.session_state.get("parsed_pkg")
+        preview_result = st.session_state.get("preview_result")
+
+        if saved_preview and not parsed_pkg:
+            parsed_pkg = saved_preview.get("package")
+            preview_result = saved_preview
+            st.session_state.parsed_pkg = parsed_pkg
+            st.session_state.preview_result = preview_result
+            saved_policy = saved_preview.get("summary", {})
+            st.session_state.selected_policy = saved_policy.get("conflict_policy", default_policy)
+            st.session_state.rename_suffix = saved_policy.get("rename_suffix", default_suffix)
+
+        if uploaded_pkg and not parsed_pkg:
             try:
                 pkg_content = uploaded_pkg.read().decode("utf-8")
                 parsed_pkg = json.loads(pkg_content)
+                st.session_state.parsed_pkg = parsed_pkg
             except (UnicodeDecodeError, json.JSONDecodeError) as e:
                 parsed_pkg = None
                 st.error(f"❌ 文件解析失败: {e}")
 
-            if parsed_pkg is not None:
-                validation = validate_scheme_package(parsed_pkg)
-                if not validation["valid"]:
-                    st.error(f"❌ 方案包校验失败: {validation['error']}")
+        if parsed_pkg is not None:
+            validation = validate_scheme_package(parsed_pkg)
+            if not validation["valid"]:
+                st.error(f"❌ 方案包校验失败: {validation['error']}")
+                if "parsed_pkg" in st.session_state:
+                    del st.session_state.parsed_pkg
+            else:
+                pkg_names = [s["name"] for s in parsed_pkg["schemes"]]
+                with get_conn() as conn:
+                    existing_names = set(s["name"] for s in get_review_schemes(conn))
+                conflicts = [n for n in pkg_names if n in existing_names]
+
+                policy_display_map = {
+                    "keep": "保留原方案（跳过）",
+                    "overwrite": "覆盖已有方案",
+                    "rename": "改名导入",
+                }
+                policy_reverse_map = {v: k for k, v in policy_display_map.items()}
+
+                current_policy = st.session_state.get("selected_policy", default_policy)
+
+                if conflicts:
+                    st.warning(f"⚠️ 以下方案名已存在: {', '.join(conflicts)}")
+                    conflict_policy_label = st.radio(
+                        "重名冲突处理方式",
+                        ["保留原方案（跳过）", "覆盖已有方案", "改名导入"],
+                        index=list(policy_reverse_map.keys()).index(policy_display_map.get(current_policy, "保留原方案（跳过）")),
+                        key="import_conflict_policy_ui",
+                    )
+                    selected_policy = policy_reverse_map[conflict_policy_label]
+                    st.session_state.selected_policy = selected_policy
                 else:
-                    st.success(f"✅ 方案包校验通过，包含 {validation['scheme_count']} 个方案")
+                    selected_policy = current_policy
+                    st.session_state.selected_policy = selected_policy
 
-                    pkg_names = [s["name"] for s in parsed_pkg["schemes"]]
+                rename_suffix = st.session_state.get("rename_suffix", default_suffix)
+                if selected_policy == "rename":
+                    rename_suffix = st.text_input(
+                        "改名后缀",
+                        value=rename_suffix,
+                        key="import_rename_suffix_ui",
+                    )
+                    st.session_state.rename_suffix = rename_suffix
+
+                if st.button("🔍 预检导入结果", type="secondary", key="preview_import_btn"):
                     with get_conn() as conn:
-                        existing_names = set(s["name"] for s in get_review_schemes(conn))
-                    conflicts = [n for n in pkg_names if n in existing_names]
+                        before_schemes = get_review_schemes(conn)
+                        before_count = len(before_schemes)
+                        before_logs = get_scheme_operation_logs(conn, limit=100)
+                        before_import_logs = [
+                            l for l in before_logs if l["operation_type"] == "import_scheme"
+                        ]
 
-                    if conflicts:
-                        st.warning(f"⚠️ 以下方案名已存在: {', '.join(conflicts)}")
-                        conflict_policy = st.radio(
-                            "重名冲突处理方式",
-                            ["保留原方案（跳过）", "覆盖已有方案", "改名导入"],
-                            key="import_conflict_policy",
-                        )
-                        policy_map = {
-                            "保留原方案（跳过）": "keep",
-                            "覆盖已有方案": "overwrite",
-                            "改名导入": "rename",
-                        }
-                        selected_policy = policy_map[conflict_policy]
-                    else:
-                        selected_policy = "keep"
-
-                    rename_suffix = None
-                    if selected_policy == "rename":
-                        rename_suffix = st.text_input(
-                            "改名后缀",
-                            value="(导入)",
-                            key="import_rename_suffix",
+                        preview_result = preview_scheme_package_import(
+                            conn, parsed_pkg,
+                            conflict_policy=selected_policy,
+                            rename_suffix=rename_suffix,
                         )
 
-                    if st.button("📥 确认导入", type="primary", key="confirm_import_scheme"):
+                        after_schemes = get_review_schemes(conn)
+                        after_count = len(after_schemes)
+                        after_logs = get_scheme_operation_logs(conn, limit=100)
+                        after_import_logs = [
+                            l for l in after_logs if l["operation_type"] == "import_scheme"
+                        ]
+
+                    if after_count != before_count:
+                        st.error("❌ 预检异常：预检阶段修改了数据库，请联系开发人员")
+                    elif len(after_import_logs) != len(before_import_logs):
+                        st.error("❌ 预检异常：预检阶段留下了操作日志，请联系开发人员")
+                    elif preview_result["success"]:
+                        st.session_state.preview_result = preview_result
                         with get_conn() as conn:
-                            result = import_scheme_package(
-                                conn, parsed_pkg,
-                                conflict_policy=selected_policy,
-                                rename_suffix=rename_suffix,
-                            )
-                        if result["success"]:
-                            st.success(
-                                f"✅ 导入完成！成功 {result['imported_count']} 个，"
-                                f"跳过 {result['skipped_count']} 个，共 {result['total']} 个"
-                            )
-                            for r in result["results"]:
-                                action_labels = {
-                                    "created": "新建",
-                                    "overwritten": "覆盖",
-                                    "renamed": "改名导入",
-                                    "kept": "保留原方案",
-                                }
-                                label = action_labels.get(r["action"], r["action"])
-                                if r["action"] == "renamed":
-                                    st.info(f"📦 '{r.get('original_name', r['name'])}' → '{r['name']}' ({label})")
-                                elif r["action"] == "kept":
-                                    st.info(f"📦 '{r['name']}' ({label})")
-                                else:
-                                    st.info(f"📦 '{r['name']}' ({label})")
-                            st.rerun()
+                            save_import_preview_context(conn, preview_result)
+                        st.success("✅ 预检完成，以下是导入预览（未写入数据库）")
+                    else:
+                        st.error(f"❌ 预检失败: {preview_result.get('error', '未知错误')}")
+
+                if preview_result and preview_result.get("success"):
+                    summary = preview_result["summary"]
+                    preview_items = preview_result["preview_results"]
+
+                    st.subheader("📋 导入预览")
+
+                    col_sum1, col_sum2, col_sum3, col_sum4 = st.columns(4)
+                    with col_sum1:
+                        st.metric("方案总数", summary["scheme_count"])
+                    with col_sum2:
+                        st.metric("新建", summary["created_count"],
+                                  help="数据库中不存在，将新建")
+                    with col_sum3:
+                        st.metric("覆盖", summary["overwritten_count"],
+                                  help="数据库中已存在，将覆盖")
+                    with col_sum4:
+                        st.metric("改名", summary["renamed_count"],
+                                  help="数据库中已存在，将改名导入")
+
+                    col_sum5, col_sum6, _ = st.columns([1, 1, 2])
+                    with col_sum5:
+                        st.metric("保留原方案", summary["kept_count"],
+                                  help="数据库中已存在，将跳过")
+                    with col_sum6:
+                        if summary.get("exported_at"):
+                            st.caption(f"📅 包导出时间: {summary['exported_at'][:19]}")
+                        if summary.get("min_date") and summary.get("max_date"):
+                            st.caption(f"📊 数据时间范围: {summary['min_date'][:10]} ~ {summary['max_date'][:10]}")
+
+                    st.markdown("**各方案处理详情：**")
+                    for item in preview_items:
+                        action = item["action"]
+                        label = SCHEME_ACTION_LABELS.get(action, action)
+                        name = item["name"]
+                        original_name = item.get("original_name", name)
+
+                        emoji_map = {
+                            SCHEME_ACTION_CREATED: "🆕",
+                            SCHEME_ACTION_OVERWRITTEN: "♻️",
+                            SCHEME_ACTION_RENAMED: "✏️",
+                            SCHEME_ACTION_KEPT: "⏭️",
+                        }
+                        emoji = emoji_map.get(action, "📦")
+
+                        if action == SCHEME_ACTION_RENAMED:
+                            st.info(f"{emoji} '{original_name}' → '{name}' ({label})")
+                        elif action == SCHEME_ACTION_KEPT:
+                            reason = item.get("reason", label)
+                            st.info(f"{emoji} '{name}' ({label}) - {reason}")
+                        elif action == SCHEME_ACTION_OVERWRITTEN:
+                            exist_desc = item.get("existing_description", "(无描述)")
+                            new_desc = item.get("description", "(无描述)")
+                            st.info(f"{emoji} '{name}' ({label})" +
+                                    (f"\n   原描述: {exist_desc} → 新描述: {new_desc}" if exist_desc != new_desc else ""))
                         else:
-                            st.error(f"❌ 导入失败: {result['error']}")
+                            desc = item.get("description", "")
+                            st.info(f"{emoji} '{name}' ({label})" + (f" - {desc}" if desc else ""))
+
+                    col_confirm, col_cancel = st.columns(2)
+                    with col_confirm:
+                        if st.button("✅ 确认导入", type="primary", key="confirm_import_scheme"):
+                            with get_conn() as conn:
+                                result = confirm_scheme_package_import(conn, preview_result)
+                            if result["success"]:
+                                actual_created = sum(
+                                    1 for r in result["results"] if r["action"] == SCHEME_ACTION_CREATED
+                                )
+                                actual_overwritten = sum(
+                                    1 for r in result["results"] if r["action"] == SCHEME_ACTION_OVERWRITTEN
+                                )
+                                actual_renamed = sum(
+                                    1 for r in result["results"] if r["action"] == SCHEME_ACTION_RENAMED
+                                )
+                                actual_kept = sum(
+                                    1 for r in result["results"] if r["action"] == SCHEME_ACTION_KEPT
+                                )
+
+                                preview_ok = (
+                                    actual_created == summary["created_count"] and
+                                    actual_overwritten == summary["overwritten_count"] and
+                                    actual_renamed == summary["renamed_count"] and
+                                    actual_kept == summary["kept_count"]
+                                )
+
+                                if not preview_ok:
+                                    st.warning(
+                                        "⚠️ 注意：实际导入结果与预览有差异，"
+                                        "可能是预检后其他操作修改了数据库"
+                                    )
+
+                                st.success(
+                                    f"✅ 导入完成！成功 {result['imported_count']} 个，"
+                                    f"跳过 {result['skipped_count']} 个，共 {result['total']} 个"
+                                )
+                                for r in result["results"]:
+                                    label = SCHEME_ACTION_LABELS.get(r["action"], r["action"])
+                                    emoji = emoji_map.get(r["action"], "📦")
+                                    if r["action"] == SCHEME_ACTION_RENAMED:
+                                        st.info(f"{emoji} '{r.get('original_name', r['name'])}' → '{r['name']}' ({label})")
+                                    elif r["action"] == SCHEME_ACTION_KEPT:
+                                        st.info(f"{emoji} '{r['name']}' ({label})")
+                                    else:
+                                        st.info(f"{emoji} '{r['name']}' ({label})")
+
+                                for k in ["parsed_pkg", "preview_result", "selected_policy", "rename_suffix"]:
+                                    if k in st.session_state:
+                                        del st.session_state[k]
+                                st.rerun()
+                            else:
+                                st.error(f"❌ 导入失败: {result['error']}")
+
+                    with col_cancel:
+                        if st.button("❌ 取消导入", key="cancel_import_scheme"):
+                            with get_conn() as conn:
+                                after_cancel_schemes = get_review_schemes(conn)
+                                after_cancel_count = len(after_cancel_schemes)
+                                clear_import_preview_context(conn)
+
+                            for k in ["parsed_pkg", "preview_result", "selected_policy", "rename_suffix"]:
+                                if k in st.session_state:
+                                    del st.session_state[k]
+
+                            st.success("✅ 已取消导入，数据库未做任何修改")
+                            st.rerun()
 
     with st.expander("📜 操作日志（最近50条）", expanded=False):
         if operation_logs:

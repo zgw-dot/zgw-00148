@@ -937,6 +937,21 @@ SCHEME_PACKAGE_REQUIRED_KEYS = {"version", "exported_at", "schemes"}
 
 SCHEME_PACKAGE_SCHEME_REQUIRED_KEYS = {"name", "filter_state"}
 
+SCHEME_IMPORT_PREVIEW_CONTEXT_KEY = "scheme_import_preview_context"
+SCHEME_IMPORT_LAST_POLICY_KEY = "scheme_import_last_policy"
+
+SCHEME_ACTION_CREATED = "created"
+SCHEME_ACTION_OVERWRITTEN = "overwritten"
+SCHEME_ACTION_RENAMED = "renamed"
+SCHEME_ACTION_KEPT = "kept"
+
+SCHEME_ACTION_LABELS = {
+    SCHEME_ACTION_CREATED: "新建",
+    SCHEME_ACTION_OVERWRITTEN: "覆盖",
+    SCHEME_ACTION_RENAMED: "改名导入",
+    SCHEME_ACTION_KEPT: "保留原方案",
+}
+
 
 def export_scheme_package(conn, scheme_ids=None):
     now = now_iso()
@@ -1029,133 +1044,374 @@ def validate_scheme_package(package):
     return {"valid": True, "scheme_count": len(schemes)}
 
 
-def import_scheme_package(conn, package, conflict_policy="keep", rename_suffix=None):
+def _compute_rename_target(conn, original_name, rename_suffix, used_names=None):
+    if used_names is None:
+        used_names = set()
+    suffix = rename_suffix or "(导入)"
+    candidate = f"{original_name}{suffix}"
+    counter = 1
+    while (candidate in used_names or
+           conn.execute("SELECT 1 FROM review_schemes WHERE name = ?", (candidate,)).fetchone()):
+        candidate = f"{original_name}{suffix}_{counter}"
+        counter += 1
+    return candidate
+
+
+def _resolve_scheme_conflict(conn, scheme, conflict_policy, rename_suffix, used_names=None):
+    name = scheme["name"]
+    description = scheme.get("description")
+    filter_state = scheme["filter_state"]
+    data_date_range = scheme.get("data_date_range")
+
+    existing = conn.execute(
+        "SELECT * FROM review_schemes WHERE name = ?", (name,)
+    ).fetchone()
+
+    if existing:
+        existing_dict = dict(existing)
+        if conflict_policy == "keep":
+            return {
+                "name": name,
+                "original_name": name,
+                "action": SCHEME_ACTION_KEPT,
+                "reason": f"方案名 '{name}' 已存在，保留原方案",
+                "description": description,
+                "filter_state": filter_state,
+                "data_date_range": data_date_range,
+                "existing_id": existing_dict["id"],
+                "existing_description": existing_dict.get("description"),
+            }
+        elif conflict_policy == "overwrite":
+            return {
+                "name": name,
+                "original_name": name,
+                "action": SCHEME_ACTION_OVERWRITTEN,
+                "description": description,
+                "filter_state": filter_state,
+                "data_date_range": data_date_range,
+                "existing_id": existing_dict["id"],
+                "existing_description": existing_dict.get("description"),
+            }
+        elif conflict_policy == "rename":
+            new_name = _compute_rename_target(conn, name, rename_suffix, used_names)
+            return {
+                "name": new_name,
+                "original_name": name,
+                "action": SCHEME_ACTION_RENAMED,
+                "description": description,
+                "filter_state": filter_state,
+                "data_date_range": data_date_range,
+            }
+        else:
+            raise ValueError(f"未知的冲突处理策略: {conflict_policy}")
+    else:
+        return {
+            "name": name,
+            "original_name": name,
+            "action": SCHEME_ACTION_CREATED,
+            "description": description,
+            "filter_state": filter_state,
+            "data_date_range": data_date_range,
+        }
+
+
+def preview_scheme_package_import(conn, package, conflict_policy="keep", rename_suffix=None):
     validation = validate_scheme_package(package)
     if not validation["valid"]:
-        return {"success": False, "error": validation["error"]}
+        return {
+            "success": False,
+            "error": validation["error"],
+            "valid": False,
+        }
 
     schemes = package["schemes"]
+    exported_at = package.get("exported_at", "")
+    scheme_count = len(schemes)
+
+    all_names = [s["name"] for s in schemes]
+    date_ranges = []
+    for s in schemes:
+        dr = s.get("data_date_range")
+        if dr and isinstance(dr, dict):
+            if dr.get("min_date"):
+                date_ranges.append(dr["min_date"])
+            if dr.get("max_date"):
+                date_ranges.append(dr["max_date"])
+
+    min_date = min(date_ranges) if date_ranges else None
+    max_date = max(date_ranges) if date_ranges else None
+
+    preview_results = []
+    used_names_in_pkg = set()
+    created_count = 0
+    overwritten_count = 0
+    renamed_count = 0
+    kept_count = 0
+
+    for s in schemes:
+        resolution = _resolve_scheme_conflict(
+            conn, s, conflict_policy, rename_suffix, used_names_in_pkg
+        )
+        preview_results.append(resolution)
+        used_names_in_pkg.add(resolution["name"])
+
+        if resolution["action"] == SCHEME_ACTION_CREATED:
+            created_count += 1
+        elif resolution["action"] == SCHEME_ACTION_OVERWRITTEN:
+            overwritten_count += 1
+        elif resolution["action"] == SCHEME_ACTION_RENAMED:
+            renamed_count += 1
+        elif resolution["action"] == SCHEME_ACTION_KEPT:
+            kept_count += 1
+
+    summary = {
+        "scheme_count": scheme_count,
+        "exported_at": exported_at,
+        "min_date": min_date,
+        "max_date": max_date,
+        "created_count": created_count,
+        "overwritten_count": overwritten_count,
+        "renamed_count": renamed_count,
+        "kept_count": kept_count,
+        "conflict_policy": conflict_policy,
+        "rename_suffix": rename_suffix,
+    }
+
+    return {
+        "success": True,
+        "valid": True,
+        "summary": summary,
+        "scheme_names": all_names,
+        "preview_results": preview_results,
+        "package": package,
+    }
+
+
+def save_import_preview_context(conn, preview_context):
+    context_to_save = {
+        "preview": preview_context,
+        "saved_at": now_iso(),
+    }
+    save_ui_state(conn, SCHEME_IMPORT_PREVIEW_CONTEXT_KEY, context_to_save)
+    policy = {
+        "conflict_policy": preview_context.get("summary", {}).get("conflict_policy", "keep"),
+        "rename_suffix": preview_context.get("summary", {}).get("rename_suffix"),
+        "saved_at": now_iso(),
+    }
+    save_ui_state(conn, SCHEME_IMPORT_LAST_POLICY_KEY, policy)
+
+
+def load_import_preview_context(conn):
+    saved = load_ui_state(conn, SCHEME_IMPORT_PREVIEW_CONTEXT_KEY, default=None)
+    if saved and isinstance(saved, dict):
+        return saved.get("preview")
+    return None
+
+
+def load_last_import_policy(conn):
+    saved = load_ui_state(conn, SCHEME_IMPORT_LAST_POLICY_KEY, default=None)
+    if saved and isinstance(saved, dict):
+        return saved
+    return None
+
+
+def clear_import_preview_context(conn):
+    save_ui_state(conn, SCHEME_IMPORT_PREVIEW_CONTEXT_KEY, None)
+
+
+def _execute_scheme_import(conn, preview_results):
     results = []
     imported_count = 0
     skipped_count = 0
+    now = now_iso()
+    used_names = set()
 
-    for s in schemes:
-        name = s["name"]
-        description = s.get("description")
-        filter_state = s["filter_state"]
-        data_date_range = s.get("data_date_range")
+    for pr in preview_results:
+        original_name = pr["original_name"]
+        description = pr.get("description")
+        filter_state = pr.get("filter_state", {})
+        data_date_range = pr.get("data_date_range")
 
         existing = conn.execute(
-            "SELECT * FROM review_schemes WHERE name = ?", (name,)
+            "SELECT * FROM review_schemes WHERE name = ?", (original_name,)
         ).fetchone()
 
-        if existing:
-            if conflict_policy == "keep":
+        target_name = pr["name"]
+        target_exists = conn.execute(
+            "SELECT 1 FROM review_schemes WHERE name = ?", (target_name,)
+        ).fetchone()
+
+        if target_exists and pr["action"] in (SCHEME_ACTION_CREATED, SCHEME_ACTION_RENAMED):
+            if target_name in used_names:
+                target_name = _compute_rename_target(conn, original_name, "(导入)", used_names)
+            else:
                 skipped_count += 1
                 results.append({
-                    "name": name,
-                    "action": "kept",
-                    "reason": f"方案名 '{name}' 已存在，保留原方案",
+                    "name": original_name,
+                    "action": SCHEME_ACTION_KEPT,
+                    "reason": f"预检后数据库状态变化，方案名 '{target_name}' 已存在，保留原方案",
+                })
+                existing_rec = conn.execute(
+                    "SELECT * FROM review_schemes WHERE name = ?", (target_name,)
+                ).fetchone()
+                if existing_rec:
+                    log_scheme_operation(
+                        conn, dict(existing_rec)["id"], target_name, "import_scheme",
+                        f"导入方案包跳过(状态变化): '{target_name}'",
+                    )
+                continue
+
+        filter_json = json.dumps(filter_state, ensure_ascii=False)
+        date_range_json = json.dumps(data_date_range, ensure_ascii=False) if data_date_range else None
+
+        if existing:
+            existing_dict = dict(existing)
+            if pr["action"] == SCHEME_ACTION_KEPT:
+                skipped_count += 1
+                results.append({
+                    "name": original_name,
+                    "action": SCHEME_ACTION_KEPT,
+                    "scheme_id": existing_dict["id"],
+                    "reason": pr.get("reason", f"方案名 '{original_name}' 已存在，保留原方案"),
                 })
                 log_scheme_operation(
-                    conn, dict(existing)["id"], name, "import_scheme",
-                    f"导入方案包跳过(保留原方案): '{name}'",
+                    conn, existing_dict["id"], original_name, "import_scheme",
+                    f"导入方案包跳过(保留原方案): '{original_name}'",
                 )
                 continue
-            elif conflict_policy == "overwrite":
-                now = now_iso()
-                filter_json = json.dumps(filter_state, ensure_ascii=False)
-                date_range_json = json.dumps(data_date_range, ensure_ascii=False) if data_date_range else None
+            elif pr["action"] == SCHEME_ACTION_OVERWRITTEN:
+                existing_id = existing_dict["id"]
                 conn.execute(
                     """UPDATE review_schemes
                        SET description = ?, filter_state_json = ?, data_date_range_json = ?,
                            updated_at = ?
-                       WHERE name = ?""",
-                    (description, filter_json, date_range_json, now, name),
+                       WHERE id = ?""",
+                    (description, filter_json, date_range_json, now, existing_id),
                 )
-                row = conn.execute("SELECT * FROM review_schemes WHERE name = ?", (name,)).fetchone()
-                scheme_id = row["id"]
                 imported_count += 1
+                used_names.add(original_name)
                 results.append({
-                    "name": name,
-                    "action": "overwritten",
-                    "scheme_id": scheme_id,
+                    "name": original_name,
+                    "original_name": original_name,
+                    "action": SCHEME_ACTION_OVERWRITTEN,
+                    "scheme_id": existing_id,
                 })
                 log_scheme_operation(
-                    conn, scheme_id, name, "import_scheme",
-                    f"导入方案包覆盖: '{name}'",
+                    conn, existing_id, original_name, "import_scheme",
+                    f"导入方案包覆盖: '{original_name}'",
                 )
                 continue
-            elif conflict_policy == "rename":
-                suffix = rename_suffix or "(导入)"
-                new_name = f"{name}{suffix}"
-                counter = 1
-                while conn.execute(
-                    "SELECT 1 FROM review_schemes WHERE name = ?", (new_name,)
-                ).fetchone():
-                    new_name = f"{name}{suffix}_{counter}"
-                    counter += 1
-                now = now_iso()
-                filter_json = json.dumps(filter_state, ensure_ascii=False)
-                date_range_json = json.dumps(data_date_range, ensure_ascii=False) if data_date_range else None
+            elif pr["action"] == SCHEME_ACTION_RENAMED:
+                used_names.add(target_name)
                 conn.execute(
                     """INSERT INTO review_schemes
                        (name, description, filter_state_json, data_date_range_json,
                         created_at, updated_at)
                        VALUES (?, ?, ?, ?, ?, ?)""",
-                    (new_name, description, filter_json, date_range_json, now, now),
+                    (target_name, description, filter_json, date_range_json, now, now),
                 )
-                row = conn.execute("SELECT * FROM review_schemes WHERE name = ?", (new_name,)).fetchone()
+                row = conn.execute("SELECT * FROM review_schemes WHERE name = ?", (target_name,)).fetchone()
                 scheme_id = row["id"]
                 imported_count += 1
                 results.append({
-                    "name": new_name,
-                    "original_name": name,
-                    "action": "renamed",
+                    "name": target_name,
+                    "original_name": original_name,
+                    "action": SCHEME_ACTION_RENAMED,
                     "scheme_id": scheme_id,
                 })
                 log_scheme_operation(
-                    conn, scheme_id, new_name, "import_scheme",
-                    f"导入方案包改名: '{name}' -> '{new_name}'",
+                    conn, scheme_id, target_name, "import_scheme",
+                    f"导入方案包改名: '{original_name}' -> '{target_name}'",
                 )
                 continue
-            else:
-                return {
-                    "success": False,
-                    "error": f"未知的冲突处理策略: {conflict_policy}",
-                    "results": results,
-                }
         else:
-            now = now_iso()
-            filter_json = json.dumps(filter_state, ensure_ascii=False)
-            date_range_json = json.dumps(data_date_range, ensure_ascii=False) if data_date_range else None
+            used_names.add(target_name)
             conn.execute(
                 """INSERT INTO review_schemes
                    (name, description, filter_state_json, data_date_range_json,
                     created_at, updated_at)
                    VALUES (?, ?, ?, ?, ?, ?)""",
-                (name, description, filter_json, date_range_json, now, now),
+                (target_name, description, filter_json, date_range_json, now, now),
             )
-            row = conn.execute("SELECT * FROM review_schemes WHERE name = ?", (name,)).fetchone()
+            row = conn.execute("SELECT * FROM review_schemes WHERE name = ?", (target_name,)).fetchone()
             scheme_id = row["id"]
             imported_count += 1
-            results.append({
-                "name": name,
-                "action": "created",
-                "scheme_id": scheme_id,
-            })
-            log_scheme_operation(
-                conn, scheme_id, name, "import_scheme",
-                f"导入方案包新建: '{name}'",
-            )
+
+            if pr["action"] == SCHEME_ACTION_RENAMED:
+                results.append({
+                    "name": target_name,
+                    "original_name": original_name,
+                    "action": SCHEME_ACTION_RENAMED,
+                    "scheme_id": scheme_id,
+                })
+                log_scheme_operation(
+                    conn, scheme_id, target_name, "import_scheme",
+                    f"导入方案包改名: '{original_name}' -> '{target_name}'",
+                )
+            else:
+                results.append({
+                    "name": target_name,
+                    "action": SCHEME_ACTION_CREATED,
+                    "scheme_id": scheme_id,
+                })
+                log_scheme_operation(
+                    conn, scheme_id, target_name, "import_scheme",
+                    f"导入方案包新建: '{target_name}'",
+                )
+            continue
 
     return {
         "success": True,
         "imported_count": imported_count,
         "skipped_count": skipped_count,
-        "total": len(schemes),
+        "total": len(preview_results),
         "results": results,
     }
+
+
+def confirm_scheme_package_import(conn, preview_context=None):
+    if preview_context is None:
+        preview_context = load_import_preview_context(conn)
+
+    if not preview_context or not isinstance(preview_context, dict):
+        return {
+            "success": False,
+            "error": "没有可确认的导入预览，请先重新上传方案包",
+        }
+
+    if not preview_context.get("success") or not preview_context.get("valid"):
+        return {
+            "success": False,
+            "error": "预览结果无效，请先重新上传方案包",
+        }
+
+    preview_results = preview_context.get("preview_results", [])
+    if not preview_results:
+        return {
+            "success": False,
+            "error": "预览结果为空，请先重新上传方案包",
+        }
+
+    result = _execute_scheme_import(conn, preview_results)
+
+    if result["success"]:
+        clear_import_preview_context(conn)
+
+    return result
+
+
+def import_scheme_package(conn, package, conflict_policy="keep", rename_suffix=None):
+    validation = validate_scheme_package(package)
+    if not validation["valid"]:
+        return {"success": False, "error": validation["error"]}
+
+    preview = preview_scheme_package_import(
+        conn, package, conflict_policy=conflict_policy, rename_suffix=rename_suffix
+    )
+    if not preview["success"]:
+        return {"success": False, "error": preview.get("error", "预检失败")}
+
+    return _execute_scheme_import(conn, preview["preview_results"])
 
 
 def get_scheme_operation_logs(conn, scheme_id=None, limit=100):

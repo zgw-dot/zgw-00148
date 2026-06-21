@@ -59,6 +59,7 @@ from db import (
     save_hp_draft, load_hp_draft, clear_hp_draft,
     save_hp_batch_selection, load_hp_batch_selection,
     generate_handover_sample_data,
+    get_hp_date_range, hp_prepare_view_data,
 )
 from import_service import import_csv
 from engine import run_attribution, CAUSE_LABELS
@@ -1705,8 +1706,8 @@ with tab6:
             key="review_date_to",
             placeholder="如 2026-12-31 或 2026-12-31T23:59:59",
         )
-        if date_range:
-            st.caption(f"📅 数据时间范围: {date_range.get('min_date','')[:10]} ~ {date_range.get('max_date','')[:10]}")
+        if date_range.get("has_data"):
+            st.caption(f"📅 数据时间范围: {date_range['range_display']}")
 
     col_btn1, col_btn2, _ = st.columns([1, 1, 3])
     with col_btn1:
@@ -2936,30 +2937,54 @@ with tab8:
     st.header("📦 复盘交接包")
 
     with get_conn() as conn:
-        saved_hp_ui = load_hp_ui_state(conn)
-        saved_hp_batch = load_hp_batch_selection(conn)
-        saved_hp_draft = load_hp_draft(conn)
+        if "hp_current_user" not in st.session_state:
+            st.session_state.hp_current_user = "admin_user"
+        if "hp_user_role" not in st.session_state:
+            st.session_state.hp_user_role = HP_ROLE_ADMIN
 
-    if "hp_current_user" not in st.session_state:
-        st.session_state.hp_current_user = "admin_user"
-    if "hp_user_role" not in st.session_state:
-        st.session_state.hp_user_role = HP_ROLE_ADMIN
-    if "hp_selected_ids" not in st.session_state:
-        st.session_state.hp_selected_ids = list(saved_hp_batch) if saved_hp_batch else []
-    if "hp_view" not in st.session_state:
-        st.session_state.hp_view = "list"
-    if "hp_detail_id" not in st.session_state:
-        st.session_state.hp_detail_id = None
-    if "hp_create_selected" not in st.session_state:
-        st.session_state.hp_create_selected = list(saved_hp_draft.get("selected_ids", [])) if saved_hp_draft else []
-    if "hp_import_preview" not in st.session_state:
-        st.session_state.hp_import_preview = None
-    if "hp_filter_store" not in st.session_state:
-        st.session_state.hp_filter_store = saved_hp_ui.get("filter_store", "全部")
-    if "hp_filter_status" not in st.session_state:
-        st.session_state.hp_filter_status = saved_hp_ui.get("filter_status", "全部")
-    if "hp_filter_receiver" not in st.session_state:
-        st.session_state.hp_filter_receiver = saved_hp_ui.get("filter_receiver", "全部")
+        hp_view_data = hp_prepare_view_data(
+            conn,
+            current_user=st.session_state.hp_current_user,
+            user_role=st.session_state.hp_user_role,
+        )
+
+    st.session_state.hp_selected_ids = list(hp_view_data["batch_selection"])
+    st.session_state.hp_view = st.session_state.get("hp_view", "list")
+    st.session_state.hp_detail_id = st.session_state.get("hp_detail_id", None)
+    st.session_state.hp_create_selected = list(
+        hp_view_data["draft"].get("selected_ids", []) if hp_view_data["draft"] else []
+    )
+    st.session_state.hp_import_preview = st.session_state.get("hp_import_preview", None)
+    st.session_state.hp_filter_store = (
+        hp_view_data["ui_state"].get("filter_store", "全部")
+        if "hp_filter_store" not in st.session_state
+        else st.session_state.hp_filter_store
+    )
+    st.session_state.hp_filter_status = (
+        hp_view_data["ui_state"].get("filter_status", "全部")
+        if "hp_filter_status" not in st.session_state
+        else st.session_state.hp_filter_status
+    )
+    st.session_state.hp_filter_receiver = (
+        hp_view_data["ui_state"].get("filter_receiver", "全部")
+        if "hp_filter_receiver" not in st.session_state
+        else st.session_state.hp_filter_receiver
+    )
+
+    if hp_view_data["startup_path"] == "empty":
+        st.info("📭 数据库为空，还没有差异数据。请先在 Tab 1 导入盘点差异数据。")
+    elif hp_view_data["startup_path"] == "draft_only":
+        st.info("💾 检测到未完成的草稿，已自动恢复。可前往「新建交接包」继续。")
+
+    if hp_view_data["hp_date_range"].get("has_data"):
+        st.caption(f"📅 交接包时间范围: {hp_view_data['hp_date_range']['range_display']}")
+    if hp_view_data["data_date_range"].get("has_data"):
+        st.caption(f"📊 差异数据时间范围: {hp_view_data['data_date_range']['range_display']}")
+    st.caption(
+        f"共 {hp_view_data['package_count']} 个交接包，"
+        f"{hp_view_data['pending_count']} 个待处理，"
+        f"{hp_view_data['discrepancy_count']} 条差异数据"
+    )
 
     hp_subtab1, hp_subtab2, hp_subtab3, hp_subtab4, hp_subtab5 = st.tabs([
         "📋 交接包列表", "➕ 新建交接包", "📤 导出 / 📥 导回", "📜 操作日志", "🔄 恢复视角",
@@ -2968,13 +2993,9 @@ with tab8:
     with hp_subtab1:
         st.subheader("交接包列表")
 
-        with get_conn() as conn:
-            hp_stores = get_hp_stores(conn)
-            hp_receivers = get_hp_receivers(conn)
-
-        all_stores_list = ["全部"] + hp_stores
+        all_stores_list = ["全部"] + hp_view_data["stores"]
         all_status_list = ["全部"] + list(HP_STATUS_LABELS.keys())
-        all_receivers_list = ["全部"] + hp_receivers
+        all_receivers_list = ["全部"] + hp_view_data["receivers"]
 
         col_hf1, col_hf2, col_hf3, col_hf4 = st.columns(4)
         with col_hf1:
@@ -3005,7 +3026,7 @@ with tab8:
         with col_hf4:
             filter_hp_keyword = st.text_input(
                 "关键词搜索",
-                value=saved_hp_ui.get("keyword", ""),
+                value=hp_view_data["ui_state"].get("keyword", ""),
                 placeholder="包号/标题/接手人",
                 key="hp_filter_keyword",
             )
@@ -3353,9 +3374,11 @@ with tab8:
             with get_conn() as conn:
                 save_hp_draft(conn, {
                     "selected_ids": st.session_state[hp_sel_key],
-                    "store_filter": ns_store_filter,
-                    "status_filter": ns_status_filter,
-                })
+                    "filter_snapshot": {
+                        "store_id": ns_store_filter if ns_store_filter != "全部" else None,
+                        "status": ns_status_filter if ns_status_filter != "全部" else None,
+                    },
+                }, strict=False)
 
             st.divider()
             st.markdown("#### 📝 交接包信息")
@@ -3644,14 +3667,14 @@ with tab8:
 
         st.divider()
         st.markdown("#### 恢复草稿")
-        if saved_hp_draft:
+        if hp_view_data["draft"]:
             st.markdown(f"发现未提交的草稿：")
-            st.json(saved_hp_draft)
+            st.json(hp_view_data["draft"])
             col_dr1, col_dr2 = st.columns(2)
             with col_dr1:
                 if st.button("✅ 恢复草稿到新建页", key="hp_restore_draft"):
-                    st.session_state.hp_create_selected = saved_hp_draft.get("selected_ids", [])
-                    st.success(f"已恢复 {len(saved_hp_draft.get('selected_ids', []))} 条已选差异")
+                    st.session_state.hp_create_selected = hp_view_data["draft"].get("selected_ids", [])
+                    st.success(f"已恢复 {len(hp_view_data['draft'].get('selected_ids', []))} 条已选差异")
             with col_dr2:
                 if st.button("🗑️ 清除草稿", key="hp_clear_draft_btn"):
                     with get_conn() as conn:

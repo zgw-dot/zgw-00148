@@ -723,7 +723,36 @@ def get_date_range(conn):
     row = conn.execute(
         "SELECT MIN(imported_at) as min_date, MAX(imported_at) as max_date FROM import_records"
     ).fetchone()
-    return dict(row) if row else None
+    raw = dict(row) if row else {}
+    min_date = raw.get("min_date")
+    max_date = raw.get("max_date")
+    has_data = bool(min_date and max_date)
+    return {
+        "min_date": min_date,
+        "max_date": max_date,
+        "has_data": has_data,
+        "min_date_display": min_date[:10] if min_date else "",
+        "max_date_display": max_date[:10] if max_date else "",
+        "range_display": f"{min_date[:10]} ~ {max_date[:10]}" if has_data else "",
+    }
+
+
+def get_hp_date_range(conn):
+    row = conn.execute(
+        "SELECT MIN(created_at) as min_date, MAX(created_at) as max_date FROM handover_packages"
+    ).fetchone()
+    raw = dict(row) if row else {}
+    min_date = raw.get("min_date")
+    max_date = raw.get("max_date")
+    has_data = bool(min_date and max_date)
+    return {
+        "min_date": min_date,
+        "max_date": max_date,
+        "has_data": has_data,
+        "min_date_display": min_date[:10] if min_date else "",
+        "max_date_display": max_date[:10] if max_date else "",
+        "range_display": f"{min_date[:10]} ~ {max_date[:10]}" if has_data else "",
+    }
 
 
 def save_review_scheme(conn, name, filter_state, description=None, overwrite=False,
@@ -939,11 +968,8 @@ def check_data_date_range_changed(conn, scheme_id):
     if not scheme:
         return {"changed": False}
 
-    saved_range = scheme.get("data_date_range")
+    saved_range = scheme.get("data_date_range") or {}
     current_range = get_date_range(conn)
-
-    if not saved_range or not current_range:
-        return {"changed": False, "saved": saved_range, "current": current_range}
 
     changed = (saved_range.get("min_date") != current_range.get("min_date") or
                saved_range.get("max_date") != current_range.get("max_date"))
@@ -3528,28 +3554,37 @@ def load_hp_ui_state(conn):
     return load_ui_state(conn, HP_UI_STATE_KEY, default={})
 
 
-def save_hp_draft(conn, draft_data):
+def save_hp_draft(conn, draft_data, strict=True):
     if not isinstance(draft_data, dict):
         raise ValueError("草稿数据必须为字典类型")
-    required_fields = ["title", "selected_ids"]
-    for field in required_fields:
-        if field not in draft_data:
-            raise ValueError(f"草稿缺少必填字段: {field}")
-    if not draft_data.get("selected_ids"):
-        raise ValueError("请至少选择一条差异记录")
-    if not draft_data.get("title", "").strip():
-        raise ValueError("请输入交接包标题")
+
+    has_title = bool(draft_data.get("title", "").strip())
+    has_selections = bool(draft_data.get("selected_ids"))
+
+    if strict:
+        required_fields = ["title", "selected_ids"]
+        for field in required_fields:
+            if field not in draft_data:
+                raise ValueError(f"草稿缺少必填字段: {field}")
+        if not draft_data.get("title", "").strip():
+            raise ValueError("请输入交接包标题")
+        if not has_selections:
+            raise ValueError("请至少选择一条差异记录")
+    else:
+        if has_title and not has_selections:
+            raise ValueError("请至少选择一条差异记录")
 
     now = now_iso()
+    existing_draft = load_hp_draft(conn) or {}
     draft_to_save = {
-        "title": draft_data.get("title", "").strip(),
-        "receiver": draft_data.get("receiver"),
-        "handover_note": draft_data.get("handover_note", ""),
-        "description": draft_data.get("description", ""),
-        "filter_snapshot": draft_data.get("filter_snapshot", {}),
-        "selected_ids": draft_data.get("selected_ids", []),
-        "evidence_summary": draft_data.get("evidence_summary", {}),
-        "created_at": draft_data.get("created_at", now),
+        "title": draft_data.get("title", existing_draft.get("title", "")).strip(),
+        "receiver": draft_data.get("receiver", existing_draft.get("receiver")),
+        "handover_note": draft_data.get("handover_note", existing_draft.get("handover_note", "")),
+        "description": draft_data.get("description", existing_draft.get("description", "")),
+        "filter_snapshot": draft_data.get("filter_snapshot", existing_draft.get("filter_snapshot", {})),
+        "selected_ids": draft_data.get("selected_ids", existing_draft.get("selected_ids", [])),
+        "evidence_summary": draft_data.get("evidence_summary", existing_draft.get("evidence_summary", {})),
+        "created_at": draft_data.get("created_at", existing_draft.get("created_at", now)),
         "updated_at": now,
     }
 
@@ -3668,3 +3703,342 @@ def generate_handover_sample_data(conn):
             filter_snapshot={"store_id": "S001"},
             created_by="morning_shift_user",
         )
+
+
+# ── Handover Package Shared Validation Layer ──
+
+HP_VALIDATION_BLOCKED = "blocked"
+HP_VALIDATION_WARNING = "warning"
+HP_VALIDATION_OK = "ok"
+
+
+def hp_check_terminal_status(pkg):
+    return pkg.get("status") in (HP_STATUS_COMPLETED, HP_STATUS_WITHDRAWN)
+
+
+def hp_validate_edit(pkg, operator=None, role=None):
+    issues = []
+    status = pkg.get("status")
+
+    if status == HP_STATUS_COMPLETED:
+        issues.append({
+            "level": HP_VALIDATION_BLOCKED,
+            "type": "already_completed",
+            "message": "已完成的交接包不允许再编辑",
+        })
+        return {"allowed": False, "issues": issues}
+
+    if status == HP_STATUS_WITHDRAWN:
+        issues.append({
+            "level": HP_VALIDATION_BLOCKED,
+            "type": "already_withdrawn",
+            "message": "已撤回的交接包不允许再编辑",
+        })
+        return {"allowed": False, "issues": issues}
+
+    if role == HP_ROLE_NORMAL and status == HP_STATUS_RECEIVED:
+        if pkg.get("received_by") and pkg["received_by"] != operator:
+            issues.append({
+                "level": HP_VALIDATION_BLOCKED,
+                "type": "not_receiver",
+                "message": "普通角色不能编辑别人已接收的交接包",
+            })
+            return {"allowed": False, "issues": issues}
+
+    return {"allowed": True, "issues": issues}
+
+
+def hp_validate_receiver_change(pkg, new_receiver, operator=None, role=None):
+    issues = []
+    if role == HP_ROLE_NORMAL and pkg.get("receiver") and new_receiver and new_receiver != pkg["receiver"]:
+        if pkg["status"] == HP_STATUS_PENDING_HANDOVER:
+            issues.append({
+                "level": HP_VALIDATION_BLOCKED,
+                "type": "receiver_immutable",
+                "message": "普通角色不能修改已指定接手人的交接包的接手人",
+            })
+            return {"allowed": False, "issues": issues}
+    return {"allowed": True, "issues": issues}
+
+
+def hp_validate_transition(pkg, to_status, operator=None, role=None):
+    issues = []
+    from_status = pkg.get("status")
+
+    if from_status == HP_STATUS_COMPLETED:
+        issues.append({
+            "level": HP_VALIDATION_BLOCKED,
+            "type": "already_completed",
+            "message": "已完成的交接包不允许再变更状态",
+        })
+        return {"allowed": False, "issues": issues}
+
+    if from_status == HP_STATUS_WITHDRAWN:
+        issues.append({
+            "level": HP_VALIDATION_BLOCKED,
+            "type": "already_withdrawn",
+            "message": "已撤回的交接包不允许再变更状态",
+        })
+        return {"allowed": False, "issues": issues}
+
+    if to_status not in HP_VALID_TRANSITIONS.get(from_status, []):
+        issues.append({
+            "level": HP_VALIDATION_BLOCKED,
+            "type": "invalid_transition",
+            "message": "不允许从 '{}' 转换到 '{}'".format(
+                HP_STATUS_LABELS.get(from_status, from_status),
+                HP_STATUS_LABELS.get(to_status, to_status),
+            ),
+        })
+        return {"allowed": False, "issues": issues}
+
+    if to_status == HP_STATUS_WITHDRAWN:
+        if role != HP_ROLE_ADMIN and pkg.get("created_by") != operator:
+            issues.append({
+                "level": HP_VALIDATION_BLOCKED,
+                "type": "not_creator",
+                "message": "普通角色只能撤回自己创建的交接包",
+            })
+            return {"allowed": False, "issues": issues}
+
+    if to_status == HP_STATUS_RECEIVED:
+        if pkg.get("received_by") and pkg["received_by"] != operator and role != HP_ROLE_ADMIN:
+            issues.append({
+                "level": HP_VALIDATION_BLOCKED,
+                "type": "already_received_other",
+                "message": "普通角色不能接管别人已接收的包",
+            })
+            return {"allowed": False, "issues": issues}
+
+        if role == HP_ROLE_NORMAL and pkg.get("receiver") and pkg["receiver"] != operator:
+            issues.append({
+                "level": HP_VALIDATION_BLOCKED,
+                "type": "not_assigned_receiver",
+                "message": "该交接包指定接手人为 '{}'，您无权接收".format(pkg["receiver"]),
+            })
+            return {"allowed": False, "issues": issues}
+
+    if to_status in (HP_STATUS_PROCESSING, HP_STATUS_COMPLETED):
+        if pkg.get("received_by") and pkg["received_by"] != operator and role != HP_ROLE_ADMIN:
+            issues.append({
+                "level": HP_VALIDATION_BLOCKED,
+                "type": "not_receiver_process",
+                "message": "普通角色不能处理别人已接收的包",
+            })
+            return {"allowed": False, "issues": issues}
+
+    return {"allowed": True, "issues": issues}
+
+
+def hp_validate_discrepancy_conflicts(conn, import_items, local_package=None):
+    conflicts = []
+
+    for imp_item in import_items:
+        disc_id = imp_item.get("discrepancy_id")
+        if not disc_id:
+            continue
+
+        local_disc = conn.execute(
+            "SELECT * FROM discrepancies WHERE id = ?", (disc_id,)
+        ).fetchone()
+        if not local_disc:
+            conflicts.append({
+                "type": "discrepancy_missing",
+                "message": "差异记录 {} 在本地不存在".format(disc_id),
+                "discrepancy_id": disc_id,
+                "blocking": True,
+            })
+            continue
+
+        local_disc = dict(local_disc)
+        snap_updated = imp_item.get("disc_updated_at")
+        if snap_updated and local_disc["updated_at"] > snap_updated:
+            conflicts.append({
+                "type": "local_newer",
+                "message": "差异 {} 本地状态更晚".format(disc_id),
+                "discrepancy_id": disc_id,
+                "blocking": True,
+                "local_value": local_disc["updated_at"],
+                "import_value": snap_updated,
+            })
+
+        snap_note = imp_item.get("review_note")
+        if snap_note and local_disc.get("review_note") and snap_note != local_disc["review_note"]:
+            conflicts.append({
+                "type": "note_changed",
+                "message": "差异 {} 复核备注已被修改".format(disc_id),
+                "discrepancy_id": disc_id,
+                "blocking": False,
+                "local_value": local_disc.get("review_note"),
+                "import_value": snap_note,
+            })
+
+        snap_status = imp_item.get("disc_status")
+        if snap_status and local_disc["status"] != snap_status:
+            conflicts.append({
+                "type": "status_changed",
+                "message": "差异 {} 状态不一致".format(disc_id),
+                "discrepancy_id": disc_id,
+                "blocking": True,
+                "local_value": local_disc["status"],
+                "import_value": snap_status,
+            })
+
+    return conflicts
+
+
+def hp_validate_package_import_conflict(conn, existing_package, import_package):
+    conflicts = []
+
+    if existing_package:
+        if existing_package["status"] == HP_STATUS_COMPLETED:
+            conflicts.append({
+                "type": "already_completed",
+                "message": "本地已为「已完成」状态，不允许覆盖",
+                "blocking": True,
+            })
+        if existing_package["status"] == HP_STATUS_WITHDRAWN:
+            conflicts.append({
+                "type": "already_withdrawn",
+                "message": "本地已为「已撤回」状态，不允许覆盖",
+                "blocking": True,
+            })
+        if existing_package.get("receiver") and import_package.get("receiver") and existing_package["receiver"] != import_package.get("receiver"):
+            conflicts.append({
+                "type": "receiver_mismatch",
+                "message": "接手人不一致",
+                "blocking": False,
+            })
+
+    import_items = import_package.get("items", [])
+    conflicts.extend(hp_validate_discrepancy_conflicts(conn, import_items))
+
+    return conflicts
+
+
+def hp_prepare_view_data(conn, current_user=None, user_role=None):
+    packages = list_handover_packages(conn)
+    draft = load_hp_draft(conn)
+    ui_state = load_hp_ui_state(conn)
+    batch_selection = load_hp_batch_selection(conn)
+    hp_date_range = get_hp_date_range(conn)
+    data_date_range = get_date_range(conn)
+    stores = get_hp_stores(conn)
+    receivers = get_hp_receivers(conn)
+    discrepancies = get_discrepancies(conn)
+
+    has_packages = len(packages) > 0
+    has_draft = draft is not None and len(draft.get("selected_ids", []))
+    has_discrepancies = len(discrepancies) > 0
+
+    if not has_packages and not has_discrepancies:
+        startup_path = "empty"
+    elif not has_packages and has_draft:
+        startup_path = "draft_only"
+    else:
+        startup_path = "has_packages"
+
+    pending_packages = [
+        p for p in packages
+        if p["status"] in (HP_STATUS_PENDING_HANDOVER, HP_STATUS_RECEIVED, HP_STATUS_PROCESSING)
+        and (p.get("receiver") == current_user or user_role == HP_ROLE_ADMIN)
+    ]
+
+    return {
+        "startup_path": startup_path,
+        "packages": packages,
+        "draft": draft,
+        "ui_state": ui_state,
+        "batch_selection": batch_selection,
+        "hp_date_range": hp_date_range,
+        "data_date_range": data_date_range,
+        "stores": stores,
+        "receivers": receivers,
+        "discrepancies": discrepancies,
+        "has_packages": has_packages,
+        "has_draft": has_draft,
+        "has_discrepancies": has_discrepancies,
+        "pending_packages": pending_packages,
+        "pending_count": len(pending_packages),
+        "package_count": len(packages),
+        "discrepancy_count": len(discrepancies),
+    }
+
+
+def hp_build_receipt_action(conn, preview_item, import_package):
+    pkg_no = preview_item.get("pkg_no")
+    imp_status = preview_item.get("import_status")
+    pkg_map = {p.get("pkg_no"): p for p in import_package.get("handover_packages", [])}
+    pkg_data = pkg_map.get(pkg_no)
+
+    result = {
+        "pkg_no": pkg_no,
+        "title": preview_item.get("title"),
+        "import_status": imp_status,
+        "action": None,
+        "reason": None,
+        "can_import": False,
+        "details": {},
+    }
+
+    if imp_status == "new":
+        disc_ids = [
+            it.get("discrepancy_id") for it in (pkg_data or {}).get("items", []) if it.get("discrepancy_id")
+        ]
+        valid_disc_ids = [did for did in disc_ids if conn.execute("SELECT 1 FROM discrepancies WHERE id = ?", (did,)).fetchone()]
+        missing = [did for did in disc_ids if did not in valid_disc_ids]
+
+        if valid_disc_ids and not missing:
+            result["action"] = "create"
+            result["can_import"] = True
+            result["reason"] = "新建交接包，包含 {} 条差异".format(len(valid_disc_ids))
+            result["details"] = {
+                "discrepancy_count": len(valid_disc_ids),
+                "discrepancy_ids": valid_disc_ids,
+                "target_status": HP_STATUS_PENDING_HANDOVER,
+            }
+        else:
+            result["action"] = "skip"
+            result["can_import"] = False
+            result["reason"] = "差异记录缺失" if missing else "没有有效的差异记录"
+            result["details"] = {"missing_discrepancies": missing}
+
+    elif imp_status == "safe":
+        existing = preview_item.get("local_package")
+        if existing:
+            target_status = (pkg_data or {}).get("status")
+            if target_status and target_status != existing["status"]:
+                if target_status in HP_VALID_TRANSITIONS.get(existing["status"], []):
+                    result["action"] = "update"
+                    result["can_import"] = True
+                    result["reason"] = "状态变更"
+                    result["details"] = {
+                        "from_status": existing["status"],
+                        "to_status": target_status,
+                        "package_id": existing["id"],
+                    }
+                else:
+                    result["action"] = "skip"
+                    result["can_import"] = False
+                    result["reason"] = "无效的状态跳转"
+            else:
+                result["action"] = "skip"
+                result["can_import"] = True
+                result["reason"] = "状态一致，无需变更"
+        else:
+            result["action"] = "create"
+            result["can_import"] = True
+            result["reason"] = "本地不存在，按新建处理"
+
+    elif imp_status == "conflict":
+        has_blocking = any(c.get("blocking", True) for c in preview_item.get("conflicts", []))
+        result["action"] = "skip"
+        result["can_import"] = not has_blocking
+        result["reason"] = preview_item.get("reason", "存在冲突")
+        result["details"] = {
+            "conflict_count": len(preview_item.get("conflicts", [])),
+            "blocking_count": sum(1 for c in preview_item.get("conflicts", []) if c.get("blocking", True)),
+            "conflicts": preview_item.get("conflicts", []),
+        }
+
+    return result

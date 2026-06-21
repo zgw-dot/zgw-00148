@@ -1007,6 +1007,14 @@ def validate_scheme_package(package):
     if len(schemes) == 0:
         return {"valid": False, "error": "方案包schemes不能为空"}
 
+    if "scheme_count" in package:
+        declared_count = package["scheme_count"]
+        if not isinstance(declared_count, int) or declared_count != len(schemes):
+            return {
+                "valid": False,
+                "error": f"方案包已损坏：scheme_count({declared_count}) 与实际 schemes 数量({len(schemes)}) 不一致",
+            }
+
     for i, s in enumerate(schemes):
         if not isinstance(s, dict):
             return {"valid": False, "error": f"第{i+1}个方案必须是对象"}

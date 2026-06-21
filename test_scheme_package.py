@@ -561,6 +561,88 @@ check("坏JSON不污染数据库", count_after_bad == count_before_bad,
 
 
 print("\n" + "=" * 70)
+print("测试 9b: scheme_count与schemes数量不一致 - 包损坏应直接拦截")
+print("=" * 70)
+
+with get_conn() as conn:
+    schemes_before_count = get_review_schemes(conn)
+    count_before_mismatch = len(schemes_before_count)
+
+mismatch_pkg = {
+    "version": "1.0",
+    "exported_at": now_iso(),
+    "scheme_count": 99,
+    "schemes": [
+        {
+            "name": "不一致测试方案1",
+            "description": "应该被拦截的方案1",
+            "filter_state": {"store_id": "MISMATCH1", "status": "全部"},
+        },
+        {
+            "name": "不一致测试方案2",
+            "description": "应该被拦截的方案2",
+            "filter_state": {"store_id": "MISMATCH2", "status": "pending_review"},
+        },
+    ],
+}
+
+v_mismatch = validate_scheme_package(mismatch_pkg)
+check("scheme_count不一致校验失败", not v_mismatch["valid"], str(v_mismatch))
+check("错误信息包含scheme_count或损坏",
+      "scheme_count" in v_mismatch.get("error", "") or "损坏" in v_mismatch.get("error", ""),
+      v_mismatch.get("error", ""))
+
+with get_conn() as conn:
+    result_mismatch = import_scheme_package(conn, mismatch_pkg)
+
+check("scheme_count不一致导入失败", not result_mismatch["success"], str(result_mismatch))
+check("导入失败返回错误信息含scheme_count", "scheme_count" in result_mismatch.get("error", ""),
+      result_mismatch.get("error", ""))
+check("导入失败imported_count为0或不存在",
+      result_mismatch.get("imported_count", 0) == 0)
+check("导入失败skipped_count为0或不存在",
+      result_mismatch.get("skipped_count", 0) == 0)
+
+with get_conn() as conn:
+    schemes_after_mismatch = get_review_schemes(conn)
+    count_after_mismatch = len(schemes_after_mismatch)
+
+check("scheme_count不一致不污染数据库", count_after_mismatch == count_before_mismatch,
+      f"前: {count_before_mismatch}, 后: {count_after_mismatch}")
+
+names_after = {s["name"] for s in schemes_after_mismatch}
+check("不一致测试方案1未被写入", "不一致测试方案1" not in names_after, str(names_after))
+check("不一致测试方案2未被写入", "不一致测试方案2" not in names_after, str(names_after))
+
+with get_conn() as conn:
+    logs_mismatch = get_scheme_operation_logs(conn, limit=200)
+
+import_mismatch_logs = [
+    l for l in logs_mismatch
+    if l["operation_type"] == "import_scheme"
+    and (
+        "不一致测试方案1" in (l.get("scheme_name") or "")
+        or "不一致测试方案2" in (l.get("scheme_name") or "")
+        or "不一致" in (l.get("operation_detail") or "")
+    )
+]
+check("scheme_count不一致不留下import_scheme日志", len(import_mismatch_logs) == 0,
+      str([l["scheme_name"] for l in import_mismatch_logs]))
+
+mismatch_count_less = {
+    "version": "1.0",
+    "exported_at": now_iso(),
+    "scheme_count": 1,
+    "schemes": [
+        {"name": "少报测试方案", "filter_state": {"store_id": "LESS"}},
+        {"name": "少报测试方案2", "filter_state": {"store_id": "LESS2"}},
+    ],
+}
+v_less = validate_scheme_package(mismatch_count_less)
+check("scheme_count少报也校验失败", not v_less["valid"], str(v_less))
+
+
+print("\n" + "=" * 70)
 print("测试 10: 重启恢复 - 导入方案后重启仍可恢复最近使用方案")
 print("=" * 70)
 

@@ -337,6 +337,8 @@ def _migrate_db(conn):
             )
         """)
 
+    _migrate_work_orders(conn)
+
 
 def now_iso():
     return datetime.now().isoformat()
@@ -1942,3 +1944,548 @@ def export_scheme_manifest(conn, scheme_ids=None, name_filter=None, updated_afte
     }
 
     return manifest
+
+
+WO_STATUS_PENDING_DISPATCH = "pending_dispatch"
+WO_STATUS_PROCESSING = "processing"
+WO_STATUS_PENDING_REVIEW = "pending_review"
+WO_STATUS_CLOSED = "closed"
+WO_STATUS_REVOKED = "revoked"
+
+WO_STATUS_LABELS = {
+    WO_STATUS_PENDING_DISPATCH: "待派发",
+    WO_STATUS_PROCESSING: "处理中",
+    WO_STATUS_PENDING_REVIEW: "待复核",
+    WO_STATUS_CLOSED: "已关闭",
+    WO_STATUS_REVOKED: "已撤销",
+}
+
+WO_VALID_TRANSITIONS = {
+    WO_STATUS_PENDING_DISPATCH: [WO_STATUS_PROCESSING, WO_STATUS_REVOKED],
+    WO_STATUS_PROCESSING: [WO_STATUS_PENDING_REVIEW, WO_STATUS_REVOKED],
+    WO_STATUS_PENDING_REVIEW: [WO_STATUS_PROCESSING, WO_STATUS_CLOSED, WO_STATUS_REVOKED],
+    WO_STATUS_CLOSED: [],
+    WO_STATUS_REVOKED: [],
+}
+
+WO_ACTION_LABELS = {
+    "price_adjust": "价格调整",
+    "inventory_correction": "库存校正",
+    "vendor_claim": "向供应商索赔",
+    "staff_training": "员工培训",
+    "process_optimization": "流程优化",
+    "write_off": "报损处理",
+    "other": "其他",
+}
+
+WO_ROLE_ADMIN = "admin"
+WO_ROLE_NORMAL = "normal"
+
+
+def _migrate_work_orders(conn):
+    wo_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='work_orders'"
+    ).fetchone()
+    if not wo_exists:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS work_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                wo_no TEXT NOT NULL UNIQUE,
+                discrepancy_id INTEGER NOT NULL,
+                store_id TEXT NOT NULL,
+                barcode TEXT NOT NULL,
+                sku_name TEXT,
+                diff_qty REAL NOT NULL,
+                attributed_cause TEXT,
+                assignee TEXT,
+                deadline TEXT,
+                action_type TEXT,
+                action_detail TEXT,
+                follow_up_result TEXT,
+                status TEXT NOT NULL DEFAULT 'pending_dispatch',
+                created_by TEXT NOT NULL DEFAULT 'user',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                closed_at TEXT,
+                FOREIGN KEY (discrepancy_id) REFERENCES discrepancies(id)
+            )
+        """)
+
+    wol_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='work_order_logs'"
+    ).fetchone()
+    if not wol_exists:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS work_order_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                work_order_id INTEGER NOT NULL,
+                action_type TEXT NOT NULL,
+                action_detail TEXT,
+                operator TEXT NOT NULL DEFAULT 'user',
+                operated_at TEXT NOT NULL,
+                FOREIGN KEY (work_order_id) REFERENCES work_orders(id)
+            )
+        """)
+
+
+def _generate_wo_no(conn):
+    now = datetime.now()
+    date_str = now.strftime("%Y%m%d")
+    prefix = f"WO{date_str}"
+    row = conn.execute(
+        "SELECT wo_no FROM work_orders WHERE wo_no LIKE ? ORDER BY id DESC LIMIT 1",
+        (f"{prefix}%",)
+    ).fetchone()
+    if row:
+        last_no = row["wo_no"]
+        seq = int(last_no[-4:]) + 1
+    else:
+        seq = 1
+    return f"{prefix}{seq:04d}"
+
+
+def create_work_order(conn, discrepancy_id, assignee=None, deadline=None,
+                      action_type=None, action_detail=None, created_by="user"):
+    disc = conn.execute(
+        "SELECT * FROM discrepancies WHERE id = ?", (discrepancy_id,)
+    ).fetchone()
+    if not disc:
+        return {"success": False, "error": f"差异记录不存在: {discrepancy_id}"}
+    disc = dict(disc)
+
+    if disc["status"] != STATUS_CONFIRMED:
+        return {
+            "success": False,
+            "error": f"只能对'已确认'状态的差异创建工单，当前状态: {STATUS_LABELS.get(disc['status'], disc['status'])}"
+        }
+
+    existing = conn.execute(
+        "SELECT * FROM work_orders WHERE discrepancy_id = ? AND status != 'revoked'",
+        (discrepancy_id,)
+    ).fetchone()
+    if existing:
+        return {
+            "success": False,
+            "error": f"该差异已有有效工单（工单号: {existing['wo_no']}），不允许重复建单",
+            "existing_wo": dict(existing),
+        }
+
+    wo_no = _generate_wo_no(conn)
+    now = now_iso()
+    conn.execute(
+        """INSERT INTO work_orders
+           (wo_no, discrepancy_id, store_id, barcode, sku_name, diff_qty,
+            attributed_cause, assignee, deadline, action_type, action_detail,
+            status, created_by, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_dispatch', ?, ?, ?)""",
+        (
+            wo_no, discrepancy_id, disc["store_id"], disc["barcode"],
+            disc.get("sku_name"), disc["diff_qty"], disc.get("attributed_cause"),
+            assignee, deadline, action_type, action_detail,
+            created_by, now, now,
+        ),
+    )
+    row = conn.execute("SELECT * FROM work_orders WHERE wo_no = ?", (wo_no,)).fetchone()
+    wo_id = row["id"]
+
+    _log_work_order_action(conn, wo_id, "create",
+                           f"创建工单，关联差异ID: {discrepancy_id}", created_by)
+
+    return {"success": True, "work_order_id": wo_id, "wo_no": wo_no}
+
+
+def batch_create_work_orders(conn, discrepancy_ids, assignee=None, deadline=None,
+                             action_type=None, created_by="user"):
+    results = []
+    success_count = 0
+    fail_count = 0
+    for did in discrepancy_ids:
+        r = create_work_order(conn, did, assignee=assignee, deadline=deadline,
+                              action_type=action_type, created_by=created_by)
+        results.append({"discrepancy_id": did, **r})
+        if r["success"]:
+            success_count += 1
+        else:
+            fail_count += 1
+    return {
+        "success": True,
+        "total": len(discrepancy_ids),
+        "success_count": success_count,
+        "fail_count": fail_count,
+        "results": results,
+    }
+
+
+def get_work_order(conn, wo_id):
+    row = conn.execute(
+        "SELECT wo.*, d.attributed_cause as disc_cause, d.cause_detail as disc_cause_detail "
+        "FROM work_orders wo LEFT JOIN discrepancies d ON wo.discrepancy_id = d.id "
+        "WHERE wo.id = ?",
+        (wo_id,),
+    ).fetchone()
+    if not row:
+        return None
+    return dict(row)
+
+
+def get_work_order_by_no(conn, wo_no):
+    row = conn.execute(
+        "SELECT * FROM work_orders WHERE wo_no = ?", (wo_no,)
+    ).fetchone()
+    if not row:
+        return None
+    return dict(row)
+
+
+def list_work_orders(conn, store_id=None, status=None, assignee=None,
+                     keyword=None, deadline_from=None, deadline_to=None):
+    sql = "SELECT * FROM work_orders WHERE 1=1"
+    params = []
+    if store_id:
+        sql += " AND store_id = ?"
+        params.append(store_id)
+    if status:
+        sql += " AND status = ?"
+        params.append(status)
+    if assignee:
+        sql += " AND assignee = ?"
+        params.append(assignee)
+    if keyword:
+        sql += " AND (wo_no LIKE ? OR barcode LIKE ? OR sku_name LIKE ?)"
+        kw = f"%{keyword}%"
+        params.extend([kw, kw, kw])
+    if deadline_from:
+        sql += " AND deadline >= ?"
+        params.append(deadline_from)
+    if deadline_to:
+        sql += " AND deadline <= ?"
+        params.append(deadline_to)
+    sql += " ORDER BY created_at DESC"
+    rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_work_order(conn, wo_id, updates, operator="user", role=WO_ROLE_ADMIN):
+    wo = get_work_order(conn, wo_id)
+    if not wo:
+        return {"success": False, "error": f"工单不存在: {wo_id}"}
+
+    if wo["status"] == WO_STATUS_CLOSED:
+        return {"success": False, "error": "已关闭工单不允许再编辑"}
+
+    if wo["status"] == WO_STATUS_REVOKED:
+        return {"success": False, "error": "已撤销工单不允许再编辑"}
+
+    allowed_fields = [
+        "assignee", "deadline", "action_type", "action_detail",
+        "follow_up_result"
+    ]
+    update_dict = {k: v for k, v in updates.items() if k in allowed_fields and v is not None}
+
+    if not update_dict:
+        return {"success": False, "error": "没有有效的更新字段"}
+
+    set_clause = ", ".join(f"{k} = ?" for k in update_dict.keys())
+    params = list(update_dict.values())
+    params.extend([now_iso(), wo_id])
+
+    conn.execute(
+        f"UPDATE work_orders SET {set_clause}, updated_at = ? WHERE id = ?",
+        params
+    )
+
+    detail = "更新字段: " + ", ".join(update_dict.keys())
+    _log_work_order_action(conn, wo_id, "update", detail, operator)
+
+    return {"success": True}
+
+
+def transition_work_order_status(conn, wo_id, to_status, operator="user",
+                                 role=WO_ROLE_ADMIN, note=None):
+    wo = get_work_order(conn, wo_id)
+    if not wo:
+        return {"success": False, "error": f"工单不存在: {wo_id}"}
+
+    from_status = wo["status"]
+
+    if from_status == WO_STATUS_CLOSED:
+        return {"success": False, "error": "已关闭工单不允许状态变更"}
+
+    if from_status == WO_STATUS_REVOKED:
+        return {"success": False, "error": "已撤销工单不允许状态变更"}
+
+    if to_status not in WO_VALID_TRANSITIONS.get(from_status, []):
+        return {
+            "success": False,
+            "error": f"不允许从 '{WO_STATUS_LABELS.get(from_status, from_status)}' "
+                     f"转换到 '{WO_STATUS_LABELS.get(to_status, to_status)}'"
+        }
+
+    if to_status == WO_STATUS_REVOKED:
+        if role != WO_ROLE_ADMIN and wo["created_by"] != operator:
+            return {
+                "success": False,
+                "error": "普通角色只能撤销自己创建的工单",
+            }
+
+    now = now_iso()
+    updates = {"status": to_status, "updated_at": now}
+    if to_status == WO_STATUS_CLOSED:
+        updates["closed_at"] = now
+
+    set_clause = ", ".join(f"{k} = ?" for k in updates.keys())
+    params = list(updates.values())
+    params.append(wo_id)
+
+    conn.execute(
+        f"UPDATE work_orders SET {set_clause} WHERE id = ?",
+        params
+    )
+
+    detail = f"状态变更: {WO_STATUS_LABELS.get(from_status, from_status)} → {WO_STATUS_LABELS.get(to_status, to_status)}"
+    if note:
+        detail += f"，备注: {note}"
+    _log_work_order_action(conn, wo_id, "status_change", detail, operator)
+
+    return {"success": True, "from_status": from_status, "to_status": to_status}
+
+
+def batch_reassign_work_orders(conn, wo_ids, new_assignee, operator="user"):
+    results = []
+    success_count = 0
+    for wid in wo_ids:
+        r = update_work_order(conn, wid, {"assignee": new_assignee},
+                              operator=operator, role=WO_ROLE_ADMIN)
+        results.append({"work_order_id": wid, **r})
+        if r["success"]:
+            success_count += 1
+    return {
+        "success": True,
+        "total": len(wo_ids),
+        "success_count": success_count,
+        "fail_count": len(wo_ids) - success_count,
+        "results": results,
+    }
+
+
+def _log_work_order_action(conn, work_order_id, action_type, action_detail=None,
+                           operator="user"):
+    now = now_iso()
+    conn.execute(
+        """INSERT INTO work_order_logs
+           (work_order_id, action_type, action_detail, operator, operated_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (work_order_id, action_type, action_detail, operator, now),
+    )
+
+
+def get_work_order_logs(conn, wo_id, limit=100):
+    rows = conn.execute(
+        "SELECT * FROM work_order_logs WHERE work_order_id = ? ORDER BY operated_at DESC LIMIT ?",
+        (wo_id, limit)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_all_work_order_logs(conn, operator=None, action_type=None, limit=200):
+    sql = "SELECT l.*, wo.wo_no FROM work_order_logs l JOIN work_orders wo ON l.work_order_id = wo.id WHERE 1=1"
+    params = []
+    if operator:
+        sql += " AND l.operator = ?"
+        params.append(operator)
+    if action_type:
+        sql += " AND l.action_type = ?"
+        params.append(action_type)
+    sql += " ORDER BY l.operated_at DESC LIMIT ?"
+    params.append(limit)
+    rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_wo_assignees(conn):
+    rows = conn.execute(
+        "SELECT DISTINCT assignee FROM work_orders WHERE assignee IS NOT NULL ORDER BY assignee"
+    ).fetchall()
+    return [r["assignee"] for r in rows if r["assignee"]]
+
+
+def get_wo_stores(conn):
+    rows = conn.execute(
+        "SELECT DISTINCT store_id FROM work_orders ORDER BY store_id"
+    ).fetchall()
+    return [r["store_id"] for r in rows if r["store_id"]]
+
+
+def export_work_orders_json(conn, store_id=None, status=None, assignee=None):
+    orders = list_work_orders(conn, store_id=store_id, status=status, assignee=assignee)
+    for wo in orders:
+        logs = get_work_order_logs(conn, wo["id"])
+        wo["logs"] = logs
+    return {
+        "export_version": "1.0",
+        "exported_at": now_iso(),
+        "filter": {
+            "store_id": store_id,
+            "status": status,
+            "assignee": assignee,
+        },
+        "total": len(orders),
+        "work_orders": orders,
+    }
+
+
+def preview_work_orders_import(conn, import_data):
+    if not isinstance(import_data, dict):
+        return {"success": False, "error": "导入数据格式错误"}
+
+    orders = import_data.get("work_orders", [])
+    if not orders:
+        return {"success": False, "error": "导入数据中没有工单记录"}
+
+    results = []
+    for wo in orders:
+        wo_no = wo.get("wo_no")
+        existing = get_work_order_by_no(conn, wo_no) if wo_no else None
+
+        status = "new"
+        reason = "新建"
+        if existing:
+            if existing["status"] == wo.get("status"):
+                status = "same"
+                reason = "状态一致，跳过"
+            else:
+                status = "update"
+                reason = f"状态变化: {WO_STATUS_LABELS.get(existing['status'], existing['status'])} → {WO_STATUS_LABELS.get(wo.get('status'), wo.get('status'))}"
+
+        results.append({
+            "wo_no": wo_no,
+            "store_id": wo.get("store_id"),
+            "barcode": wo.get("barcode"),
+            "import_status": status,
+            "reason": reason,
+            "importing_data": wo,
+            "existing_data": existing,
+        })
+
+    return {
+        "success": True,
+        "total": len(results),
+        "new_count": sum(1 for r in results if r["import_status"] == "new"),
+        "update_count": sum(1 for r in results if r["import_status"] == "update"),
+        "same_count": sum(1 for r in results if r["import_status"] == "same"),
+        "preview_results": results,
+    }
+
+
+def replay_work_order_statuses(conn, preview_results, operator="user"):
+    updated_count = 0
+    results = []
+
+    for item in preview_results:
+        if item["import_status"] == "same":
+            results.append({
+                "wo_no": item["wo_no"],
+                "action": "skipped",
+                "reason": "状态一致，跳过",
+            })
+            continue
+
+        importing = item["importing_data"]
+        wo_no = importing.get("wo_no")
+
+        if item["import_status"] == "new":
+            if not importing.get("discrepancy_id"):
+                results.append({
+                    "wo_no": wo_no,
+                    "action": "skipped",
+                    "reason": "新建工单需要关联差异ID，当前数据缺失",
+                })
+                continue
+            r = create_work_order(
+                conn,
+                importing["discrepancy_id"],
+                assignee=importing.get("assignee"),
+                deadline=importing.get("deadline"),
+                action_type=importing.get("action_type"),
+                action_detail=importing.get("action_detail"),
+                created_by=importing.get("created_by", operator),
+            )
+            if r["success"]:
+                results.append({
+                    "wo_no": r["wo_no"],
+                    "action": "created",
+                })
+            else:
+                results.append({
+                    "wo_no": wo_no,
+                    "action": "failed",
+                    "reason": r.get("error", "创建失败"),
+                })
+            continue
+
+        if item["import_status"] == "update":
+            existing = item["existing_data"]
+            target_status = importing.get("status")
+
+            r = transition_work_order_status(
+                conn, existing["id"], target_status,
+                operator=operator, role=WO_ROLE_ADMIN,
+                note=f"导入回放状态变更（来自 {importing.get('updated_at', '导入文件')}）"
+            )
+            if r["success"]:
+                updated_count += 1
+                results.append({
+                    "wo_no": wo_no,
+                    "action": "updated",
+                    "from_status": r["from_status"],
+                    "to_status": r["to_status"],
+                })
+            else:
+                results.append({
+                    "wo_no": wo_no,
+                    "action": "failed",
+                    "reason": r.get("error", "更新失败"),
+                })
+
+    return {
+        "success": True,
+        "total": len(results),
+        "updated_count": updated_count,
+        "created_count": sum(1 for r in results if r["action"] == "created"),
+        "skipped_count": sum(1 for r in results if r["action"] == "skipped"),
+        "failed_count": sum(1 for r in results if r["action"] == "failed"),
+        "results": results,
+    }
+
+
+WO_UI_STATE_KEY = "work_order_ui_state"
+WO_DRAFT_KEY = "work_order_draft"
+WO_BATCH_SELECT_KEY = "work_order_batch_selection"
+
+
+def save_wo_ui_state(conn, state):
+    save_ui_state(conn, WO_UI_STATE_KEY, state)
+
+
+def load_wo_ui_state(conn):
+    return load_ui_state(conn, WO_UI_STATE_KEY, default={})
+
+
+def save_wo_draft(conn, draft_data):
+    save_ui_state(conn, WO_DRAFT_KEY, draft_data)
+
+
+def load_wo_draft(conn):
+    return load_ui_state(conn, WO_DRAFT_KEY, default=None)
+
+
+def clear_wo_draft(conn):
+    save_ui_state(conn, WO_DRAFT_KEY, None)
+
+
+def save_wo_batch_selection(conn, selected_ids):
+    save_ui_state(conn, WO_BATCH_SELECT_KEY, selected_ids)
+
+
+def load_wo_batch_selection(conn):
+    return load_ui_state(conn, WO_BATCH_SELECT_KEY, default=[])

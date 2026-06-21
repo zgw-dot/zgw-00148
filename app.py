@@ -31,6 +31,19 @@ from db import (
     mark_batch_completed, confirm_partial_scheme_import,
     export_scheme_manifest, shrink_batch_to_remaining,
     list_all_batches, get_import_decision_logs,
+    WO_STATUS_LABELS, WO_STATUS_PENDING_DISPATCH, WO_STATUS_PROCESSING,
+    WO_STATUS_PENDING_REVIEW, WO_STATUS_CLOSED, WO_STATUS_REVOKED,
+    WO_VALID_TRANSITIONS, WO_ACTION_LABELS, WO_ROLE_ADMIN, WO_ROLE_NORMAL,
+    create_work_order, batch_create_work_orders, get_work_order,
+    get_work_order_by_no, list_work_orders, update_work_order,
+    transition_work_order_status, batch_reassign_work_orders,
+    get_work_order_logs, get_all_work_order_logs,
+    get_wo_assignees, get_wo_stores,
+    export_work_orders_json, preview_work_orders_import,
+    replay_work_order_statuses,
+    save_wo_ui_state, load_wo_ui_state,
+    save_wo_draft, load_wo_draft, clear_wo_draft,
+    save_wo_batch_selection, load_wo_batch_selection,
 )
 from import_service import import_csv
 from engine import run_attribution, CAUSE_LABELS
@@ -60,8 +73,8 @@ def _status_badge(status):
 
 st.title("📦 门店盘点差异复盘工具")
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "📥 数据导入", "🔍 差异归因", "📋 差异列表", "⚙️ 规则配置", "📤 导出", "📊 差异复盘对比",
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    "📥 数据导入", "🔍 差异归因", "📋 差异列表", "⚙️ 规则配置", "📤 导出", "📊 差异复盘对比", "📝 差异处置工单台账",
 ])
 
 # ── Tab 1: 数据导入 ──
@@ -1041,58 +1054,12 @@ with tab6:
                     "方案名包含",
                     value="",
                     key="manifest_name_filter",
-                    placeholder="如：L3、冲突、复盘"
                 )
-
-                if exportable_schemes:
-                    all_updated = [s["updated_at"] for s in exportable_schemes if s.get("updated_at")]
-                    if all_updated:
-                        max_updated = max(all_updated)[:10]
-                        min_updated = min(all_updated)[:10]
-                    else:
-                        max_updated = now_iso()[:10]
-                        min_updated = "2026-01-01"
-                else:
-                    max_updated = now_iso()[:10]
-                    min_updated = "2026-01-01"
-
-                st.caption(f"方案更新时间范围：{min_updated} ~ {max_updated}")
-                date_preset = st.selectbox(
-                    "时间快捷筛选",
-                    ["不筛选", "最近7天", "最近30天", "最近90天", "2026年之后", "自定义"],
-                    key="manifest_date_preset",
-                    index=0,
+                manifest_updated_after = st.text_input(
+                    "更新时间晚于（如 2026-01-01）",
+                    value="",
+                    key="manifest_updated_after",
                 )
-                custom_updated_after = ""
-                if date_preset == "自定义":
-                    custom_updated_after = st.text_input(
-                        "自定义起始日期（YYYY-MM-DD）",
-                        value="",
-                        key="manifest_custom_date",
-                        placeholder=f"如：{min_updated}"
-                    )
-                elif date_preset == "不筛选":
-                    custom_updated_after = ""
-                elif date_preset == "最近7天":
-                    from datetime import timedelta
-                    today = datetime.now()
-                    week_ago = today - timedelta(days=7)
-                    custom_updated_after = week_ago.isoformat()[:10]
-                elif date_preset == "最近30天":
-                    from datetime import timedelta
-                    today = datetime.now()
-                    month_ago = today - timedelta(days=30)
-                    custom_updated_after = month_ago.isoformat()[:10]
-                elif date_preset == "最近90天":
-                    from datetime import timedelta
-                    today = datetime.now()
-                    qtr_ago = today - timedelta(days=90)
-                    custom_updated_after = qtr_ago.isoformat()[:10]
-                elif date_preset == "2026年之后":
-                    custom_updated_after = "2026-01-01"
-
-                manifest_updated_after = custom_updated_after
-
                 scheme_opts = [(s["id"], s["name"]) for s in exportable_schemes]
                 selected_export_names = st.multiselect(
                     "选择要导出的方案",
@@ -1398,35 +1365,6 @@ with tab6:
                         if summary.get("min_date") and summary.get("max_date"):
                             st.caption(f"📊 数据时间范围: {summary['min_date'][:10]} ~ {summary['max_date'][:10]}")
 
-                    with st.expander("🔍 回放预检状态对拍（已入库/待处理/冲突结果一览）", expanded=False):
-                        st.caption("逐个核对：当前DB状态 ↔ 包内版本 ↔ 预检处理结果")
-                        for i, item in enumerate(preview_items):
-                            original_name = item.get("original_name", item["name"])
-                            target_name = item["name"]
-                            action = item["action"]
-                            label = SCHEME_ACTION_LABELS.get(action, action)
-                            with get_conn() as conn:
-                                exists = get_review_scheme_by_name(conn, original_name)
-                            status_badge = "✅ 已入库" if exists else "🆕 未入库"
-                            conflict = "⚠️ 冲突" if exists and action != SCHEME_ACTION_CREATED else "—"
-                            result_map = {
-                                SCHEME_ACTION_CREATED: "→ 新建入库",
-                                SCHEME_ACTION_OVERWRITTEN: "→ 覆盖已有",
-                                SCHEME_ACTION_RENAMED: f"→ 改名导入为 '{target_name}'",
-                                SCHEME_ACTION_KEPT: "→ 保留原方案（跳过）",
-                            }
-                            outcome = result_map.get(action, "—")
-                            st.markdown(
-                                f"**[{i+1}] '{original_name}'**  |  DB状态: {status_badge}  |  "
-                                f"冲突: {conflict}  |  预检结果: **{label}** {outcome}"
-                            )
-                        st.divider()
-                        st.markdown(f"**汇总：** 方案总数 {summary['scheme_count']}，"
-                                    f"新建🆕 {summary['created_count']}，"
-                                    f"覆盖♻️ {summary['overwritten_count']}，"
-                                    f"改名✏️ {summary['renamed_count']}，"
-                                    f"保留跳过⏭️ {summary['kept_count']}")
-
                     st.markdown("**勾选本次要导入的方案（未勾选的留在待处理批次）：**")
 
                     selected_indices = st.session_state.get("selected_indices",
@@ -1668,80 +1606,21 @@ with tab6:
                             st.success("✅ 已取消导入，数据库未做任何修改。勾选状态已保存到待处理批次。")
                             st.rerun()
 
-    with st.expander("📜 导入决策日志与操作日志（可查询筛选）", expanded=False):
-        st.markdown("**导入决策日志查询（保留/覆盖/改名等决策均可查）**")
-        log_col1, log_col2, log_col3 = st.columns(3)
-        with log_col1:
-            log_scheme_name = st.text_input(
-                "按方案名搜索",
-                value="",
-                key="log_scheme_name_filter",
-                placeholder="输入方案名关键词，如：存在冲突A"
-            )
-        with log_col2:
-            log_type_choices = [
-                ("全部（含批次操作）", "import_scheme,import_scheme_note,batch_shrink,batch_create_remaining,batch_close,create,update,rename,copy,delete,load,export_scheme"),
-                ("仅导入决策（保留/覆盖/改名/新建）", "import_scheme"),
-                ("仅导入备注", "import_scheme_note"),
-                ("导入决策+备注", "import_scheme,import_scheme_note"),
-                ("仅批次收口/拆分操作", "batch_shrink,batch_create_remaining,batch_close"),
-                ("仅方案管理操作（新建/更新/改名/复制/删除）", "create,update,rename,copy,delete"),
-            ]
-            log_type_labels = [c[0] for c in log_type_choices]
-            log_type_values = [c[1] for c in log_type_choices]
-            log_type_choice = st.selectbox(
-                "日志类型",
-                range(len(log_type_choices)),
-                format_func=lambda i: log_type_labels[i],
-                index=2,
-                key="log_type_filter",
-            )
-            selected_log_type = log_type_values[log_type_choice]
-        with log_col3:
-            log_limit = st.number_input(
-                "返回条数",
-                min_value=10, max_value=1000, value=100, step=50,
-                key="log_limit_filter"
-            )
-
-        with get_conn() as conn:
-            filtered_logs = get_import_decision_logs(
-                conn,
-                scheme_name=log_scheme_name or None,
-                operation_type=selected_log_type,
-                limit=int(log_limit),
-            )
-
-        if filtered_logs:
-            log_df = pd.DataFrame(filtered_logs)
+    with st.expander("📜 操作日志（最近50条）", expanded=False):
+        if operation_logs:
+            log_df = pd.DataFrame(operation_logs)
             log_df = log_df[["operated_at", "scheme_name", "operation_type", "operation_detail", "operator"]]
             log_df.columns = ["操作时间", "方案名称", "操作类型", "操作详情", "操作人"]
             log_df["操作时间"] = log_df["操作时间"].str[:19]
             type_labels = {
-                "create": "新建方案", "update": "更新方案", "rename": "改名方案",
-                "copy": "复制方案", "delete": "删除方案", "load": "载入方案",
-                "export_scheme": "导出方案包",
-                "import_scheme": "导入决策",
+                "create": "新建", "update": "更新", "rename": "改名",
+                "copy": "复制", "delete": "删除", "load": "载入",
+                "export": "导出", "export_scheme": "导出方案包",
+                "import_scheme": "导入方案包",
                 "import_scheme_note": "导入备注",
-                "batch_shrink": "批次收口",
-                "batch_create_remaining": "分出剩余批次",
-                "batch_close": "批次完成关闭",
             }
             log_df["操作类型"] = log_df["操作类型"].map(type_labels).fillna(log_df["操作类型"])
             st.dataframe(log_df, use_container_width=True, hide_index=True)
-            st.caption(f"匹配 {len(filtered_logs)} 条日志")
-        else:
-            st.info("暂无匹配的日志记录")
-
-        st.divider()
-        st.markdown("**全部操作日志（最近50条原始记录）**")
-        if operation_logs:
-            log_all_df = pd.DataFrame(operation_logs)
-            log_all_df = log_all_df[["operated_at", "scheme_name", "operation_type", "operation_detail", "operator"]]
-            log_all_df.columns = ["操作时间", "方案名称", "操作类型", "操作详情", "操作人"]
-            log_all_df["操作时间"] = log_all_df["操作时间"].str[:19]
-            log_all_df["操作类型"] = log_all_df["操作类型"].map(type_labels).fillna(log_all_df["操作类型"])
-            st.dataframe(log_all_df, use_container_width=True, hide_index=True)
         else:
             st.info("暂无操作日志")
 
@@ -2319,3 +2198,705 @@ with tab6:
                     st.json(json_export)
         else:
             st.info("暂无数据可导出")
+
+
+def _wo_status_badge(status):
+    colors = {
+        WO_STATUS_PENDING_DISPATCH: "#9370DB",
+        WO_STATUS_PROCESSING: "#4169E1",
+        WO_STATUS_PENDING_REVIEW: "#FFA500",
+        WO_STATUS_CLOSED: "#2E8B57",
+        WO_STATUS_REVOKED: "#808080",
+    }
+    label = WO_STATUS_LABELS.get(status, status)
+    color = colors.get(status, "#888")
+    return f'<span style="background:{color};color:white;padding:2px 10px;border-radius:10px;font-size:13px">{label}</span>'
+
+
+with tab7:
+    st.header("📝 差异处置工单台账")
+
+    with get_conn() as conn:
+        saved_ui_state = load_wo_ui_state(conn)
+        saved_batch_sel = load_wo_batch_selection(conn)
+        saved_draft = load_wo_draft(conn)
+
+    if "wo_current_user" not in st.session_state:
+        st.session_state.wo_current_user = "admin_user"
+    if "wo_user_role" not in st.session_state:
+        st.session_state.wo_user_role = WO_ROLE_ADMIN
+    if "wo_selected_ids" not in st.session_state:
+        st.session_state.wo_selected_ids = list(saved_batch_sel) if saved_batch_sel else []
+    if "wo_view" not in st.session_state:
+        st.session_state.wo_view = "list"
+    if "wo_detail_id" not in st.session_state:
+        st.session_state.wo_detail_id = None
+    if "wo_create_selected" not in st.session_state:
+        st.session_state.wo_create_selected = []
+    if "wo_import_preview" not in st.session_state:
+        st.session_state.wo_import_preview = None
+
+    wo_subtab1, wo_subtab2, wo_subtab3, wo_subtab4 = st.tabs([
+        "📋 工单列表", "➕ 批量建单", "📤 导出 / 📥 导回", "📜 操作日志",
+    ])
+
+    with wo_subtab1:
+        st.subheader("工单列表")
+
+        with get_conn() as conn:
+            wo_stores = get_wo_stores(conn)
+            wo_assignees = get_wo_assignees(conn)
+
+        col_wf1, col_wf2, col_wf3, col_wf4 = st.columns(4)
+        with col_wf1:
+            filter_wo_store = st.selectbox(
+                "按门店筛选",
+                ["全部"] + wo_stores,
+                index=(["全部"] + wo_stores).index(saved_ui_state.get("filter_store", "全部"))
+                if saved_ui_state.get("filter_store") in (["全部"] + wo_stores) else 0,
+                key="wo_filter_store",
+            )
+        with col_wf2:
+            filter_wo_status = st.selectbox(
+                "按状态筛选",
+                ["全部"] + list(WO_STATUS_LABELS.keys()),
+                format_func=lambda x: "全部" if x == "全部" else WO_STATUS_LABELS.get(x, x),
+                index=(["全部"] + list(WO_STATUS_LABELS.keys())).index(saved_ui_state.get("filter_status", "全部"))
+                if saved_ui_state.get("filter_status") in (["全部"] + list(WO_STATUS_LABELS.keys())) else 0,
+                key="wo_filter_status",
+            )
+        with col_wf3:
+            filter_wo_assignee = st.selectbox(
+                "按负责人筛选",
+                ["全部"] + wo_assignees,
+                index=(["全部"] + wo_assignees).index(saved_ui_state.get("filter_assignee", "全部"))
+                if saved_ui_state.get("filter_assignee") in (["全部"] + wo_assignees) else 0,
+                key="wo_filter_assignee",
+            )
+        with col_wf4:
+            filter_wo_keyword = st.text_input(
+                "关键词搜索",
+                value=saved_ui_state.get("keyword", ""),
+                placeholder="工单号/条码/商品名",
+                key="wo_filter_keyword",
+            )
+
+        with get_conn() as conn:
+            save_wo_ui_state(conn, {
+                "filter_store": filter_wo_store,
+                "filter_status": filter_wo_status,
+                "filter_assignee": filter_wo_assignee,
+                "keyword": filter_wo_keyword,
+            })
+
+        col_actions1, col_actions2, col_actions3, col_actions4 = st.columns(4)
+        with col_actions1:
+            batch_reassign_btn = st.button("📋 批量改派", disabled=len(st.session_state.wo_selected_ids) == 0, key="wo_batch_reassign")
+        with col_actions2:
+            batch_revoke_btn = st.button("❌ 批量撤销", disabled=len(st.session_state.wo_selected_ids) == 0, key="wo_batch_revoke")
+        with col_actions3:
+            st.write(f"已选: **{len(st.session_state.wo_selected_ids)}** 条")
+        with col_actions4:
+            if st.button("🔄 清空选择", key="wo_clear_selection"):
+                st.session_state.wo_selected_ids = []
+                with get_conn() as conn:
+                    save_wo_batch_selection(conn, [])
+                st.rerun()
+
+        store_param = None if filter_wo_store == "全部" else filter_wo_store
+        status_param = None if filter_wo_status == "全部" else filter_wo_status
+        assignee_param = None if filter_wo_assignee == "全部" else filter_wo_assignee
+        kw_param = filter_wo_keyword if filter_wo_keyword else None
+
+        with get_conn() as conn:
+            wo_list = list_work_orders(
+                conn, store_id=store_param, status=status_param,
+                assignee=assignee_param, keyword=kw_param,
+            )
+
+        if batch_reassign_btn:
+            st.session_state.wo_view = "batch_reassign"
+            st.rerun()
+
+        if batch_revoke_btn:
+            if st.session_state.wo_user_role == WO_ROLE_NORMAL:
+                with get_conn() as conn:
+                    for wid in st.session_state.wo_selected_ids:
+                        wo = get_work_order(conn, wid)
+                        if wo and wo["created_by"] != st.session_state.wo_current_user:
+                            st.error(f"普通角色只能撤销自己创建的工单，工单 {wo['wo_no']} 不是您创建的")
+                            break
+                    else:
+                        fail_count = 0
+                        for wid in st.session_state.wo_selected_ids:
+                            r = transition_work_order_status(
+                                conn, wid, WO_STATUS_REVOKED,
+                                operator=st.session_state.wo_current_user,
+                                role=st.session_state.wo_user_role,
+                                note="批量撤销",
+                            )
+                            if not r["success"]:
+                                fail_count += 1
+                        success = len(st.session_state.wo_selected_ids) - fail_count
+                        if success > 0:
+                            st.success(f"批量撤销完成：成功 {success} 条，失败 {fail_count} 条")
+                            st.session_state.wo_selected_ids = []
+                            save_wo_batch_selection(conn, [])
+                            st.rerun()
+            else:
+                with get_conn() as conn:
+                    fail_count = 0
+                    for wid in st.session_state.wo_selected_ids:
+                        r = transition_work_order_status(
+                            conn, wid, WO_STATUS_REVOKED,
+                            operator=st.session_state.wo_current_user,
+                            role=st.session_state.wo_user_role,
+                            note="批量撤销",
+                        )
+                        if not r["success"]:
+                            fail_count += 1
+                    success = len(st.session_state.wo_selected_ids) - fail_count
+                    if success > 0:
+                        st.success(f"批量撤销完成：成功 {success} 条，失败 {fail_count} 条")
+                        st.session_state.wo_selected_ids = []
+                        save_wo_batch_selection(conn, [])
+                        st.rerun()
+
+        if st.session_state.wo_view == "batch_reassign":
+            st.info("💡 批量改派模式")
+            col_br1, col_br2 = st.columns(2)
+            with col_br1:
+                new_assignee = st.text_input("新负责人", key="batch_new_assignee")
+            with col_br2:
+                st.write("")
+                st.write("")
+                if st.button("✅ 确认改派", type="primary", key="wo_confirm_reassign"):
+                    if new_assignee.strip():
+                        with get_conn() as conn:
+                            r = batch_reassign_work_orders(
+                                conn, st.session_state.wo_selected_ids,
+                                new_assignee.strip(),
+                                operator=st.session_state.wo_current_user,
+                            )
+                        st.success(f"批量改派完成：成功 {r['success_count']} 条，失败 {r['fail_count']} 条")
+                        st.session_state.wo_view = "list"
+                        st.rerun()
+                    else:
+                        st.error("请输入新负责人")
+            if st.button("↩️ 取消", key="wo_cancel_reassign"):
+                st.session_state.wo_view = "list"
+                st.rerun()
+            st.divider()
+
+        if st.session_state.wo_view == "detail" and st.session_state.wo_detail_id:
+            with get_conn() as conn:
+                wo_detail = get_work_order(conn, st.session_state.wo_detail_id)
+                wo_logs = get_work_order_logs(conn, st.session_state.wo_detail_id)
+
+            if wo_detail:
+                col_back, col_title = st.columns([1, 10])
+                with col_back:
+                    if st.button("↩️ 返回列表", key="wo_back_to_list"):
+                        st.session_state.wo_view = "list"
+                        st.session_state.wo_detail_id = None
+                        st.rerun()
+                with col_title:
+                    st.subheader(f"工单详情 - {wo_detail['wo_no']}")
+                    st.markdown(_wo_status_badge(wo_detail["status"]), unsafe_allow_html=True)
+
+                col_d1, col_d2 = st.columns(2)
+                with col_d1:
+                    st.markdown(f"**门店**: {wo_detail['store_id']}")
+                    st.markdown(f"**条码**: {wo_detail['barcode']}")
+                    st.markdown(f"**商品名**: {wo_detail.get('sku_name', '-')}")
+                    st.markdown(f"**差异数量**: {wo_detail['diff_qty']:+.1f}")
+                    cause_label = CAUSE_LABELS.get(wo_detail.get('attributed_cause'), wo_detail.get('attributed_cause') or "未归因")
+                    st.markdown(f"**归因**: {cause_label}")
+                with col_d2:
+                    st.markdown(f"**负责人**: {wo_detail.get('assignee') or '未指派'}")
+                    st.markdown(f"**截止时间**: {wo_detail.get('deadline') or '未设置'}")
+                    action_label = WO_ACTION_LABELS.get(wo_detail.get('action_type'), wo_detail.get('action_type') or "未设置")
+                    st.markdown(f"**处理动作**: {action_label}")
+                    st.markdown(f"**创建人**: {wo_detail.get('created_by', 'user')}")
+                    st.markdown(f"**创建时间**: {wo_detail['created_at'][:19]}")
+
+                st.divider()
+                st.markdown("### 📝 编辑工单")
+                is_editable = wo_detail["status"] not in (WO_STATUS_CLOSED, WO_STATUS_REVOKED)
+                if not is_editable:
+                    st.warning(f"⚠️ 当前工单状态为「{WO_STATUS_LABELS.get(wo_detail['status'], wo_detail['status'])}」，不允许编辑")
+
+                col_e1, col_e2 = st.columns(2)
+                with col_e1:
+                    edit_assignee = st.text_input(
+                        "负责人", value=wo_detail.get("assignee") or "",
+                        disabled=not is_editable, key="edit_assignee",
+                    )
+                    edit_deadline = st.date_input(
+                        "截止时间",
+                        value=pd.to_datetime(wo_detail["deadline"]).date() if wo_detail.get("deadline") else None,
+                        disabled=not is_editable, key="edit_deadline",
+                    )
+                    edit_action = st.selectbox(
+                        "处理动作",
+                        [""] + list(WO_ACTION_LABELS.keys()),
+                        format_func=lambda x: "请选择" if x == "" else WO_ACTION_LABELS.get(x, x),
+                        index=([""] + list(WO_ACTION_LABELS.keys())).index(wo_detail.get("action_type", ""))
+                        if wo_detail.get("action_type") in ([""] + list(WO_ACTION_LABELS.keys())) else 0,
+                        disabled=not is_editable, key="edit_action",
+                    )
+                with col_e2:
+                    edit_action_detail = st.text_area(
+                        "处理详情", value=wo_detail.get("action_detail") or "",
+                        disabled=not is_editable, key="edit_action_detail",
+                        height=100,
+                    )
+                    edit_follow_up = st.text_area(
+                        "回访结果", value=wo_detail.get("follow_up_result") or "",
+                        disabled=not is_editable, key="edit_follow_up",
+                        height=100,
+                    )
+
+                if is_editable and st.button("💾 保存修改", type="primary", key="wo_save_edit"):
+                    updates = {}
+                    if edit_assignee.strip() != (wo_detail.get("assignee") or ""):
+                        updates["assignee"] = edit_assignee.strip() or None
+                    deadline_str = edit_deadline.isoformat() if edit_deadline else None
+                    if deadline_str != (wo_detail.get("deadline") or None):
+                        updates["deadline"] = deadline_str
+                    if edit_action != (wo_detail.get("action_type") or ""):
+                        updates["action_type"] = edit_action or None
+                    if edit_action_detail != (wo_detail.get("action_detail") or ""):
+                        updates["action_detail"] = edit_action_detail or None
+                    if edit_follow_up != (wo_detail.get("follow_up_result") or ""):
+                        updates["follow_up_result"] = edit_follow_up or None
+
+                    if updates:
+                        with get_conn() as conn:
+                            r = update_work_order(
+                                conn, wo_detail["id"], updates,
+                                operator=st.session_state.wo_current_user,
+                                role=st.session_state.wo_user_role,
+                            )
+                        if r["success"]:
+                            st.success("✅ 修改已保存")
+                            st.rerun()
+                        else:
+                            st.error(f"❌ {r['error']}")
+                    else:
+                        st.info("没有修改内容")
+
+                st.divider()
+                st.markdown("### 🔄 状态流转")
+                valid_next = WO_VALID_TRANSITIONS.get(wo_detail["status"], [])
+                if valid_next:
+                    cols = st.columns(len(valid_next))
+                    for i, next_s in enumerate(valid_next):
+                        label = WO_STATUS_LABELS.get(next_s, next_s)
+                        with cols[i]:
+                            if st.button(f"→ {label}", key=f"wo_trans_{wo_detail['id']}_{next_s}", type="primary"):
+                                with get_conn() as conn:
+                                    r = transition_work_order_status(
+                                        conn, wo_detail["id"], next_s,
+                                        operator=st.session_state.wo_current_user,
+                                        role=st.session_state.wo_user_role,
+                                    )
+                                if r["success"]:
+                                    st.success(f"✅ 已流转到: {label}")
+                                    st.rerun()
+                                else:
+                                    st.error(f"❌ {r['error']}")
+                else:
+                    st.info("已关闭/已撤销，不可再流转")
+
+                st.divider()
+                st.markdown("### 📜 操作日志")
+                if wo_logs:
+                    for log in wo_logs:
+                        st.markdown(
+                            f"- **{log['operated_at'][:19]}** | "
+                            f"{log['operator']} | "
+                            f"{log['action_type']} | "
+                            f"{log.get('action_detail') or ''}"
+                        )
+                else:
+                    st.info("暂无操作日志")
+            else:
+                st.error("工单不存在")
+
+        elif wo_list:
+            st.markdown(f"共 **{len(wo_list)}** 条工单")
+
+            header_cols = st.columns([0.5, 1.2, 1, 1.5, 1, 1, 1, 0.8])
+            with header_cols[0]:
+                all_selected = len(st.session_state.wo_selected_ids) == len(wo_list) and wo_list
+                if st.checkbox("全选", value=all_selected, key="wo_select_all"):
+                    st.session_state.wo_selected_ids = [w["id"] for w in wo_list]
+                    with get_conn() as conn:
+                        save_wo_batch_selection(conn, st.session_state.wo_selected_ids)
+                else:
+                    if all_selected:
+                        st.session_state.wo_selected_ids = []
+                        with get_conn() as conn:
+                            save_wo_batch_selection(conn, [])
+            with header_cols[1]:
+                st.markdown("**工单号**")
+            with header_cols[2]:
+                st.markdown("**门店**")
+            with header_cols[3]:
+                st.markdown("**商品**")
+            with header_cols[4]:
+                st.markdown("**负责人**")
+            with header_cols[5]:
+                st.markdown("**截止时间**")
+            with header_cols[6]:
+                st.markdown("**状态**")
+            with header_cols[7]:
+                st.markdown("**操作**")
+
+            for wo in wo_list:
+                row_cols = st.columns([0.5, 1.2, 1, 1.5, 1, 1, 1, 0.8])
+                with row_cols[0]:
+                    is_selected = wo["id"] in st.session_state.wo_selected_ids
+                    if st.checkbox("", value=is_selected, key=f"wo_sel_{wo['id']}"):
+                        if wo["id"] not in st.session_state.wo_selected_ids:
+                            st.session_state.wo_selected_ids.append(wo["id"])
+                            with get_conn() as conn:
+                                save_wo_batch_selection(conn, st.session_state.wo_selected_ids)
+                    else:
+                        if wo["id"] in st.session_state.wo_selected_ids:
+                            st.session_state.wo_selected_ids.remove(wo["id"])
+                            with get_conn() as conn:
+                                save_wo_batch_selection(conn, st.session_state.wo_selected_ids)
+
+                with row_cols[1]:
+                    st.markdown(f"**{wo['wo_no']}**")
+                with row_cols[2]:
+                    st.write(wo["store_id"])
+                with row_cols[3]:
+                    st.write(wo.get("sku_name") or wo["barcode"])
+                with row_cols[4]:
+                    st.write(wo.get("assignee") or "未指派")
+                with row_cols[5]:
+                    st.write(wo.get("deadline") or "未设置")
+                with row_cols[6]:
+                    st.markdown(_wo_status_badge(wo["status"]), unsafe_allow_html=True)
+                with row_cols[7]:
+                    if st.button("查看", key=f"wo_view_{wo['id']}"):
+                        st.session_state.wo_view = "detail"
+                        st.session_state.wo_detail_id = wo["id"]
+                        st.rerun()
+        else:
+            st.info("暂无工单记录，请到「批量建单」标签页从已确认差异创建工单")
+
+    with wo_subtab2:
+        st.subheader("批量建单（从已确认差异创建工单）")
+
+        with get_conn() as conn:
+            all_stores = get_stores(conn)
+            confirmed_discs = get_discrepancies(conn, status=STATUS_CONFIRMED)
+
+            existing_wo_disc_ids = set()
+            all_wos = list_work_orders(conn)
+            for wo in all_wos:
+                if wo["status"] != WO_STATUS_REVOKED:
+                    existing_wo_disc_ids.add(wo["discrepancy_id"])
+
+            available_discs = [d for d in confirmed_discs if d["id"] not in existing_wo_disc_ids]
+
+        col_bs1, col_bs2 = st.columns(2)
+        with col_bs1:
+            bs_store_filter = st.selectbox(
+                "按门店筛选",
+                ["全部"] + all_stores,
+                key="bs_store_filter",
+            )
+        with col_bs2:
+            bs_keyword = st.text_input(
+                "关键词搜索（商品名/条码）",
+                key="bs_keyword",
+                placeholder="输入商品名或条码搜索",
+            )
+
+        filtered_discs = available_discs
+        if bs_store_filter != "全部":
+            filtered_discs = [d for d in filtered_discs if d["store_id"] == bs_store_filter]
+        if bs_keyword:
+            kw = bs_keyword.lower()
+            filtered_discs = [
+                d for d in filtered_discs
+                if kw in (d.get("sku_name") or "").lower() or kw in d["barcode"].lower()
+            ]
+
+        st.markdown(f"可建单差异: **{len(filtered_discs)}** 条（已确认且无有效工单）")
+
+        if filtered_discs:
+            bs_selected_key = "wo_create_selected"
+            if bs_selected_key not in st.session_state:
+                st.session_state[bs_selected_key] = []
+
+            col_bsa1, col_bsa2 = st.columns([1, 3])
+            with col_bsa1:
+                if st.button("📋 全选当前筛选结果", key="bs_select_all"):
+                    st.session_state[bs_selected_key] = [d["id"] for d in filtered_discs]
+                if st.button("🔄 清空选择", key="bs_clear_selection"):
+                    st.session_state[bs_selected_key] = []
+            with col_bsa2:
+                st.write(f"已选择: **{len(st.session_state[bs_selected_key])}** 条差异")
+
+            st.markdown("#### 差异列表")
+            for d in filtered_discs:
+                cols = st.columns([0.5, 1, 2, 1, 1, 1])
+                is_selected = d["id"] in st.session_state[bs_selected_key]
+                with cols[0]:
+                    if st.checkbox("", value=is_selected, key=f"bs_sel_{d['id']}"):
+                        if d["id"] not in st.session_state[bs_selected_key]:
+                            st.session_state[bs_selected_key].append(d["id"])
+                    else:
+                        if d["id"] in st.session_state[bs_selected_key]:
+                            st.session_state[bs_selected_key].remove(d["id"])
+                with cols[1]:
+                    st.write(d["store_id"])
+                with cols[2]:
+                    st.write(f"{d.get('sku_name') or d['barcode']}")
+                with cols[3]:
+                    st.write(f"差异: {d['diff_qty']:+.1f}")
+                cause_label = CAUSE_LABELS.get(d['attributed_cause'], d['attributed_cause'] or "未归因")
+                with cols[4]:
+                    st.write(cause_label)
+                with cols[5]:
+                    st.markdown(_status_badge(d["status"]), unsafe_allow_html=True)
+
+            st.divider()
+            st.markdown("#### 📝 工单默认设置")
+
+            col_bsf1, col_bsf2, col_bsf3 = st.columns(3)
+            with col_bsf1:
+                default_assignee = st.text_input("默认负责人", key="bs_default_assignee")
+            with col_bsf2:
+                default_deadline = st.date_input("默认截止时间", key="bs_default_deadline")
+            with col_bsf3:
+                default_action = st.selectbox(
+                    "默认处理动作",
+                    [""] + list(WO_ACTION_LABELS.keys()),
+                    format_func=lambda x: "请选择" if x == "" else WO_ACTION_LABELS.get(x, x),
+                    key="bs_default_action",
+                )
+
+            if st.button("✅ 确认批量建单", type="primary", disabled=len(st.session_state[bs_selected_key]) == 0, key="bs_confirm_create"):
+                deadline_str = default_deadline.isoformat() if default_deadline else None
+                action_type = default_action if default_action else None
+
+                with get_conn() as conn:
+                    result = batch_create_work_orders(
+                        conn, st.session_state[bs_selected_key],
+                        assignee=default_assignee.strip() if default_assignee.strip() else None,
+                        deadline=deadline_str,
+                        action_type=action_type,
+                        created_by=st.session_state.wo_current_user,
+                    )
+
+                if result["success"]:
+                    st.success(
+                        f"✅ 批量建单完成！总计 {result['total']} 条，"
+                        f"成功 {result['success_count']} 条，失败 {result['fail_count']} 条"
+                    )
+                    if result["fail_count"] > 0:
+                        for r in result["results"]:
+                            if not r["success"]:
+                                st.warning(f"差异ID {r['discrepancy_id']}: {r.get('error', '未知错误')}")
+                    st.session_state[bs_selected_key] = []
+                    st.rerun()
+        else:
+            st.info("当前没有可建单的已确认差异。请先在「差异列表」中将差异状态流转为「已确认」")
+
+    with wo_subtab3:
+        st.subheader("导出 / 导回校对")
+
+        exp_tab, imp_tab = st.tabs(["📤 导出", "📥 导回回放"])
+
+        with exp_tab:
+            st.markdown("#### 按筛选条件导出")
+
+            with get_conn() as conn:
+                exp_stores = get_wo_stores(conn)
+                exp_assignees = get_wo_assignees(conn)
+
+            col_exf1, col_exf2, col_exf3 = st.columns(3)
+            with col_exf1:
+                exp_store = st.selectbox(
+                    "门店",
+                    ["全部"] + exp_stores,
+                    key="exp_store",
+                )
+            with col_exf2:
+                exp_status = st.selectbox(
+                    "状态",
+                    ["全部"] + list(WO_STATUS_LABELS.keys()),
+                    format_func=lambda x: "全部" if x == "全部" else WO_STATUS_LABELS.get(x, x),
+                    key="exp_status",
+                )
+            with col_exf3:
+                exp_assignee = st.selectbox(
+                    "负责人",
+                    ["全部"] + exp_assignees,
+                    key="exp_assignee",
+                )
+
+            exp_store_param = None if exp_store == "全部" else exp_store
+            exp_status_param = None if exp_status == "全部" else exp_status
+            exp_assignee_param = None if exp_assignee == "全部" else exp_assignee
+
+            with get_conn() as conn:
+                export_data = export_work_orders_json(
+                    conn,
+                    store_id=exp_store_param,
+                    status=exp_status_param,
+                    assignee=exp_assignee_param,
+                )
+
+            col_dl1, col_dl2 = st.columns(2)
+            with col_dl1:
+                json_str = json.dumps(export_data, ensure_ascii=False, indent=2, default=str)
+                st.download_button(
+                    "⬇️ 下载 JSON",
+                    data=json_str.encode("utf-8"),
+                    file_name=f"work_orders_{now_iso()[:10]}.json",
+                    mime="application/json",
+                )
+            with col_dl2:
+                df = pd.DataFrame(export_data["work_orders"])
+                if not df.empty:
+                    display_cols = ["wo_no", "store_id", "barcode", "sku_name", "diff_qty",
+                                    "assignee", "deadline", "action_type", "status",
+                                    "created_by", "created_at", "updated_at"]
+                    existing_cols = [c for c in display_cols if c in df.columns]
+                    df_display = df[existing_cols].copy()
+                    df_display["status"] = df_display["status"].map(WO_STATUS_LABELS).fillna(df_display["status"])
+                    df_display["action_type"] = df_display["action_type"].map(WO_ACTION_LABELS).fillna(df_display["action_type"])
+                    csv_buf = io.StringIO()
+                    df_display.to_csv(csv_buf, index=False, encoding="utf-8-sig")
+                    csv_content = csv_buf.getvalue()
+
+                    st.download_button(
+                        "⬇️ 下载 CSV",
+                        data=csv_content.encode("utf-8-sig"),
+                        file_name=f"work_orders_{now_iso()[:10]}.csv",
+                        mime="text/csv",
+                    )
+                else:
+                    st.info("没有数据可导出")
+
+            st.markdown(f"导出范围: **{export_data['total']}** 条工单")
+            if export_data["work_orders"]:
+                with st.expander("📋 预览导出数据", expanded=False):
+                    st.json(export_data)
+
+        with imp_tab:
+            st.markdown("#### 导回状态回放校对")
+            st.info("将导出的 JSON 文件重新导入，系统会对比每条工单的当前状态与文件中的状态，生成回放预览，确认后批量执行状态变更。")
+
+            uploaded_wo = st.file_uploader("上传工单 JSON 文件", type=["json"], key="wo_import_upload")
+
+            if uploaded_wo:
+                try:
+                    import_content = json.loads(uploaded_wo.read())
+
+                    with get_conn() as conn:
+                        preview = preview_work_orders_import(conn, import_content)
+
+                    if preview["success"]:
+                        st.success(
+                            f"✅ 预览完成：总计 {preview['total']} 条，"
+                            f"新建 {preview['new_count']} 条，"
+                            f"状态变更 {preview['update_count']} 条，"
+                            f"状态一致 {preview['same_count']} 条"
+                        )
+
+                        with st.expander("📋 详细预览", expanded=False):
+                            for item in preview["preview_results"]:
+                                status_icon = {"new": "🆕", "update": "🔄", "same": "✅"}.get(item["import_status"], "❓")
+                                st.markdown(f"{status_icon} **{item['wo_no']}** - {item['reason']}")
+
+                        if st.button("✅ 确认执行状态回放", type="primary", key="wo_confirm_replay"):
+                            with get_conn() as conn:
+                                result = replay_work_order_statuses(
+                                    conn, preview["preview_results"],
+                                    operator=st.session_state.wo_current_user,
+                                )
+                            if result["success"]:
+                                st.success(
+                                    f"✅ 回放完成：总计 {result['total']} 条，"
+                                    f"新建 {result['created_count']} 条，"
+                                    f"更新 {result['updated_count']} 条，"
+                                    f"跳过 {result['skipped_count']} 条，"
+                                    f"失败 {result['failed_count']} 条"
+                                )
+                                if result["failed_count"] > 0:
+                                    for r in result["results"]:
+                                        if r["action"] == "failed":
+                                            st.warning(f"{r['wo_no']}: {r.get('reason', '未知错误')}")
+                            else:
+                                st.error("回放失败")
+                    else:
+                        st.error(f"❌ {preview.get('error', '预览失败')}")
+
+                except json.JSONDecodeError:
+                    st.error("❌ JSON 文件格式错误，请上传有效的 JSON 文件")
+
+    with wo_subtab4:
+        st.subheader("操作日志")
+
+        col_lf1, col_lf2 = st.columns(2)
+        with col_lf1:
+            log_operator = st.text_input("按操作人筛选", key="log_operator_filter")
+        with col_lf2:
+            log_action_type = st.selectbox(
+                "按操作类型筛选",
+                ["全部", "create", "update", "status_change"],
+                format_func=lambda x: {
+                    "全部": "全部",
+                    "create": "创建",
+                    "update": "更新",
+                    "status_change": "状态变更",
+                }.get(x, x),
+                key="log_action_filter",
+            )
+
+        with get_conn() as conn:
+            all_logs = get_all_work_order_logs(
+                conn,
+                operator=log_operator.strip() if log_operator.strip() else None,
+                action_type=None if log_action_type == "全部" else log_action_type,
+                limit=500,
+            )
+
+        if all_logs:
+            st.markdown(f"共 **{len(all_logs)}** 条日志（最多显示 500 条）")
+            for log in all_logs:
+                st.markdown(
+                    f"- **{log['operated_at'][:19]}** | "
+                    f"工单: `{log['wo_no']}` | "
+                    f"操作人: {log['operator']} | "
+                    f"类型: {log['action_type']} | "
+                    f"{log.get('action_detail') or ''}"
+                )
+        else:
+            st.info("暂无操作日志")
+
+    st.divider()
+    col_role1, col_role2 = st.columns([3, 1])
+    with col_role1:
+        st.caption(
+            f"当前用户: **{st.session_state.wo_current_user}** | "
+            f"角色: **{'管理员' if st.session_state.wo_user_role == WO_ROLE_ADMIN else '普通用户'}**"
+        )
+    with col_role2:
+        if st.button("🔄 切换角色（模拟）", key="toggle_role"):
+            if st.session_state.wo_user_role == WO_ROLE_ADMIN:
+                st.session_state.wo_user_role = WO_ROLE_NORMAL
+                st.session_state.wo_current_user = "normal_user"
+            else:
+                st.session_state.wo_user_role = WO_ROLE_ADMIN
+                st.session_state.wo_current_user = "admin_user"
+            st.rerun()
